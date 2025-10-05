@@ -12,7 +12,6 @@ export default async function handler(req) {
 
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
   
-  // Using Trading Economics guest key (free, may be rate-limited)
   const today = new Date().toISOString().slice(0, 10);
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
   
@@ -49,7 +48,13 @@ export default async function handler(req) {
     const already = await kv.get(dedupeKey);
     if (already) continue;
 
-    const text = `🔔 *${e.Country}: ${e.Event}* (High)\nWhen: ${fmtTime(when)}\n${e.Forecast ? `Forecast: ${e.Forecast}` : ''}${e.Previous ? `\nPrev: ${e.Previous}` : ''}`;
+    const country = translateCountry(e.Country);
+    const event = e.Event || 'حدث';
+    const whenLocal = fmtTime(when);
+    const forecast = e.Forecast ? `\nالتوقع: ${e.Forecast}` : '';
+    const previous = e.Previous ? `\nالسابق: ${e.Previous}` : '';
+
+    const text = `🔔 *${country}: ${event}* (مهم)\nالوقت: ${whenLocal}${forecast}${previous}`;
     
     for (const chat of subs) {
       await send(BOT_TOKEN, chat, text);
@@ -76,9 +81,25 @@ async function send(token, chat, text) {
 }
 
 function fmtTime(d) {
-  return new Intl.DateTimeFormat('en-GB', { 
+  return new Intl.DateTimeFormat('ar-AE', { 
     dateStyle: 'medium', 
     timeStyle: 'short', 
     timeZone: 'Asia/Dubai' 
   }).format(d);
+}
+
+function translateCountry(en) {
+  const map = {
+    'United States': 'الولايات المتحدة',
+    'Euro Area': 'منطقة اليورو',
+    'United Kingdom': 'المملكة المتحدة',
+    'China': 'الصين',
+    'Japan': 'اليابان',
+    'Germany': 'ألمانيا',
+    'France': 'فرنسا',
+    'Canada': 'كندا',
+    'Australia': 'أستراليا',
+    'Switzerland': 'سويسرا'
+  };
+  return map[en] || en;
 }
