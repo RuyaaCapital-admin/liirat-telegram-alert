@@ -1,41 +1,47 @@
-
+cat > api/cron.js << 'EOF'
 import { kv } from '@vercel/kv';
 
+export const config = { 
+  runtime: 'edge',
+  maxDuration: 60
+};
+
 export default async function handler(req) {
-  // Verify Vercel Cron secret
-  if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
     return new Response('unauthorized', { status: 401 });
   }
 
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
   const FMP_KEY = process.env.FMP_API_KEY;
   
-  // Fetch FMP calendar (today + tomorrow)
   const today = new Date().toISOString().slice(0, 10);
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
   
   const url = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${today}&to=${tomorrow}&apikey=${FMP_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) return new Response('fmp error', { status: 500 });
   
-  const events = await res.json();
+  let events;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return new Response('fmp error', { status: 500 });
+    events = await res.json();
+  } catch (e) {
+    return new Response('fmp timeout', { status: 500 });
+  }
   
-  // Get subscribers
   const subKeys = await kv.keys('sub:*');
   const subs = subKeys.map(k => k.replace('sub:', ''));
   if (!subs.length) return new Response('no subs');
 
   const now = new Date();
-  const LEAD_MS = 15 * 60 * 1000; // 15 min
+  const LEAD_MS = 15 * 60 * 1000;
+  let sent = 0;
 
   for (const e of events) {
-    // FMP fields: date, country, event, impact (Low/Medium/High), actual, estimate, previous
     if (e.impact !== 'High') continue;
 
-    const when = new Date(e.date); // FMP gives ISO string
+    const when = new Date(e.date);
     const msTo = when - now;
 
-    // Alert if within 15 min window, not already sent
     if (msTo > LEAD_MS || msTo < -5 * 60 * 1000) continue;
 
     const dedupeKey = `sent:${e.country}:${e.event}:${e.date}`;
@@ -44,16 +50,15 @@ export default async function handler(req) {
 
     const text = `🔔 *${e.country}: ${e.event}* (High)\nWhen: ${fmtTime(when)}\n${e.estimate ? `Est: ${e.estimate}` : ''}${e.previous ? `\nPrev: ${e.previous}` : ''}`;
     
-    // Broadcast
     for (const chat of subs) {
       await send(BOT_TOKEN, chat, text);
     }
 
-    // Mark sent (48h TTL)
     await kv.set(dedupeKey, '1', { ex: 172800 });
+    sent++;
   }
 
-  return new Response('ok');
+  return new Response(`ok - sent ${sent} alerts`);
 }
 
 async function send(token, chat, text) {
@@ -76,3 +81,6 @@ function fmtTime(d) {
     timeZone: 'Asia/Dubai' 
   }).format(d);
 }
+EOF
+
+vercel --prod
