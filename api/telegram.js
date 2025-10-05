@@ -1,11 +1,3 @@
-# Navigate to project
-cd liirat-econ-alerts
-
-# Backup old file
-cp api/telegram.js api/telegram.js.backup
-
-# Create fixed version
-cat > api/telegram.js << 'EOF'
 import { kv } from '@vercel/kv';
 
 export const config = { runtime: 'edge' };
@@ -58,7 +50,3 @@ async function send(token, chat, text) {
     })
   });
 }
-EOF
-
-# Redeploy
-vercel --prod
