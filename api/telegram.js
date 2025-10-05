@@ -23,17 +23,23 @@ export default async function handler(req) {
 
   if (text === '/econ_on') {
     await kv.set(`sub:${chat}`, '1');
-    await send(BOT_TOKEN, chat, '✅ Subscribed to high-impact econ alerts.\n\n/econ_off to stop\n/econ_test to check status');
+    await send(BOT_TOKEN, chat, '✅ تم الاشتراك في تنبيهات الأحداث الاقتصادية المهمة\n\n/econ_off لإلغاء الاشتراك\n/econ_test للتحقق من الحالة\n/econ_subs عدد المشتركين');
   }
   else if (text === '/econ_off') {
     await kv.del(`sub:${chat}`);
-    await send(BOT_TOKEN, chat, '❌ Unsubscribed from alerts.');
+    await send(BOT_TOKEN, chat, '❌ تم إلغاء الاشتراك');
   }
   else if (text === '/econ_test') {
-    await send(BOT_TOKEN, chat, '🟢 Alerts bot active. Cron checks every 5 min for high-impact events.');
+    await send(BOT_TOKEN, chat, '🟢 البوت نشط. الفحص كل 5 دقائق للأحداث المهمة');
+  }
+  else if (text === '/econ_subs') {
+    const subKeys = await kv.keys('sub:*');
+    const count = subKeys.length;
+    const ids = subKeys.map(k => k.replace('sub:', '')).join('\n');
+    await send(BOT_TOKEN, chat, `📊 عدد المشتركين: ${count}\n\n${ids || 'لا يوجد'}`);
   }
   else if (text === '/start' || text === 'hi' || text === 'telegram webhook') {
-    await send(BOT_TOKEN, chat, '👋 Welcome to liirat Economic Alerts!\n\nCommands:\n/econ_on - Subscribe\n/econ_off - Unsubscribe\n/econ_test - Check status');
+    await send(BOT_TOKEN, chat, '👋 مرحباً بك في تنبيهات liirat الاقتصادية\n\nالأوامر:\n/econ_on - اشترك\n/econ_off - إلغاء الاشتراك\n/econ_test - تحقق من الحالة\n/econ_subs - عدد المشتركين');
   }
 
   return new Response('ok');
