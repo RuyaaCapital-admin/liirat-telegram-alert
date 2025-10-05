@@ -3,7 +3,7 @@ import { kv } from '@vercel/kv';
 
 export default async function handler(req) {
   // Verify Vercel Cron secret
-  if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
     return new Response('unauthorized', { status: 401 });
   }
 
