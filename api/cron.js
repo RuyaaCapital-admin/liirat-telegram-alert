@@ -1,6 +1,5 @@
-import { kv } from '@vercel/kv';
 
-export const config = { runtime: 'edge' };
+import { kv } from '@vercel/kv';
 
 export default async function handler(req) {
   // Verify Vercel Cron secret

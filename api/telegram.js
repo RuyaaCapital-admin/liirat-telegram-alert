@@ -1,6 +1,5 @@
-import { kv } from '@vercel/kv';
 
-export const config = { runtime: 'edge' };
+import { kv } from '@vercel/kv';
 
 export default async function handler(req) {
   if (req.method !== 'POST') return new Response('ok');
