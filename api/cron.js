@@ -11,20 +11,20 @@ export default async function handler(req) {
   }
 
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
-  const FMP_KEY = process.env.FMP_API_KEY;
   
+  // Using Trading Economics guest key (free, may be rate-limited)
   const today = new Date().toISOString().slice(0, 10);
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
   
-  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${today}&to=${tomorrow}&apikey=${FMP_KEY}`;
+  const url = `https://api.tradingeconomics.com/calendar/country/All/${today}/${tomorrow}?c=guest:guest&importance=3&f=json`;
   
   let events;
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return new Response('fmp error', { status: 500 });
+    if (!res.ok) return new Response('api error', { status: 500 });
     events = await res.json();
   } catch (e) {
-    return new Response('fmp timeout', { status: 500 });
+    return new Response('api timeout', { status: 500 });
   }
   
   const subKeys = await kv.keys('sub:*');
@@ -36,18 +36,20 @@ export default async function handler(req) {
   let sent = 0;
 
   for (const e of events) {
-    if (e.impact !== 'High') continue;
+    const imp = String(e.Importance ?? '3');
+    if (imp !== '3') continue;
 
-    const when = new Date(e.date);
+    const when = new Date(e.Date + 'Z');
     const msTo = when - now;
 
     if (msTo > LEAD_MS || msTo < -5 * 60 * 1000) continue;
 
-    const dedupeKey = `sent:${e.country}:${e.event}:${e.date}`;
+    const id = e.CalendarId ?? `${e.Country}-${e.Event}-${e.Date}`;
+    const dedupeKey = `sent:${id}`;
     const already = await kv.get(dedupeKey);
     if (already) continue;
 
-    const text = `🔔 *${e.country}: ${e.event}* (High)\nWhen: ${fmtTime(when)}\n${e.estimate ? `Est: ${e.estimate}` : ''}${e.previous ? `\nPrev: ${e.previous}` : ''}`;
+    const text = `🔔 *${e.Country}: ${e.Event}* (High)\nWhen: ${fmtTime(when)}\n${e.Forecast ? `Forecast: ${e.Forecast}` : ''}${e.Previous ? `\nPrev: ${e.Previous}` : ''}`;
     
     for (const chat of subs) {
       await send(BOT_TOKEN, chat, text);
