@@ -1,144 +1,134 @@
 import { kv } from '@vercel/kv';
 
-export const config = { 
-  runtime: 'edge',
-  maxDuration: 60
-};
+export const config = { runtime: 'edge', maxDuration: 60 };
 
 export default async function handler(req) {
   try {
-    // Auth check
-    if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
-      return new Response('unauthorized', { status: 401 });
+    // Auth (allow Vercel Cron or your bearer token)
+    const auth = req.headers.get('authorization') || '';
+    const isVercelCron = req.headers.get('x-vercel-cron') === '1';
+    if (!(isVercelCron || auth === `Bearer ${process.env.CRON_SECRET}`)) {
+      return json({ ok: false, error: 'unauthorized' }, 401);
     }
 
-    const BOT_TOKEN = process.env.TG_BOT_TOKEN;
-    const FMP_KEY = process.env.FMP_API_KEY;
-    
-    // Check env vars
+    // Use liirat bot token; fall back to legacy TG_BOT_TOKEN if set
+    const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+    const FMP_KEY   = process.env.FMP_API_KEY;
     if (!BOT_TOKEN || !FMP_KEY) {
-      return new Response(JSON.stringify({
+      return json({
+        ok: false,
         error: 'missing env vars',
         has_bot_token: !!BOT_TOKEN,
         has_fmp_key: !!FMP_KEY
-      }), { 
-        status: 500,
-        headers: { 'content-type': 'application/json' }
-      });
+      }, 500);
     }
-    
-    // Get subscribers
-    const subscribers = await kv.smembers('econ:subs') || [];
-    const validSubs = subscribers.filter(id => {
-      const idStr = String(id);
-      return !idStr.includes('{') && !idStr.includes('}') && /^\d+$/.test(idStr);
+
+    // Subscribers (set econ:subs with numeric chat IDs)
+    const subs = await kv.smembers('econ:subs') || [];
+    const validSubs = subs.filter(id => /^\d+$/.test(String(id)));
+    if (!validSubs.length) return json({ ok: true, sent: 0, reason: 'no valid subscribers' });
+
+    // ---- Fetch FMP calendar (today->tomorrow) ----
+    const url = new URL(req.url);
+    const from = url.searchParams.get('from') || new Date().toISOString().slice(0, 10);
+    const to   = url.searchParams.get('to')   || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const api  = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
+
+    const r = await fetch(api, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return json({ ok: false, error: 'fmp api error', status: r.status, response: await r.text() }, 502);
+
+    let events = await r.json();
+    if (!Array.isArray(events)) events = [];
+
+    // ---- Window + filtering ----
+    const windowMin = Number(url.searchParams.get('minutes') || 15);     // widen via ?minutes=240 for testing
+    const dry       = url.searchParams.get('dry') === '1';               // ?dry=1 to compute without sending
+
+    const now = Date.now();
+    const start = now - 5 * 60 * 1000;                     // allow late by 5 min
+    const end   = now + windowMin * 60 * 1000;
+
+    const highImpact = v => {
+      const s = String(v || '').toLowerCase();
+      return s === 'high' || s === '3' || s === 'high impact';
+    };
+
+    const parseUTC = s => {
+      if (!s) return null;
+      const d = new Date(`${String(s).replace(' ', 'T')}Z`);
+      return isFinite(d) ? d : null;
+    };
+
+    const upcoming = events.filter(e => {
+      if (!highImpact(e.impact) && !highImpact(e.importance)) return false;
+      const d = parseUTC(e.date || e.datetime || e.Date);
+      if (!d) return false;
+      const t = d.getTime();
+      return t > start && t <= end;
     });
-    
-    if (!validSubs.length) {
-      return new Response('ok - no valid subscribers', { status: 200 });
-    }
-    
-    // FMP API
-    const today = new Date().toISOString().slice(0, 10);
-    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-    const url = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${today}&to=${tomorrow}&apikey=${FMP_KEY}`;
-    
-    let events;
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) {
-        const errorText = await res.text();
-        return new Response(JSON.stringify({
-          error: 'fmp api error',
-          status: res.status,
-          response: errorText
-        }), { 
-          status: 500,
-          headers: { 'content-type': 'application/json' }
-        });
-      }
-      events = await res.json();
-    } catch (e) {
-      return new Response(JSON.stringify({
-        error: 'api timeout or fetch error',
-        message: e.message
-      }), { 
-        status: 500,
-        headers: { 'content-type': 'application/json' }
-      });
-    }
 
-    const now = new Date();
-    const LEAD_MS = 15 * 60 * 1000;
+    // Cache for /econ_upcoming
+    await kv.set('econ:cache:upcoming', JSON.stringify({ at: Date.now(), items: upcoming.slice(0, 50) }), { ex: 120 });
+
+    // ---- Send ----
     let sent = 0;
+    for (const ev of upcoming) {
+      const when = parseUTC(ev.date || ev.datetime || ev.Date);
+      const whenLocal = when ? fmtTime(when) : '—';
+      const estimate = ev.estimate ? `\nEstimate | التوقع: ${ev.estimate}` : '';
+      const previous = ev.previous ? `\nPrevious | السابق: ${ev.previous}` : '';
+      const countryAr = translateCountry(ev.country);
 
-    for (const e of events) {
-      if (e.impact !== 'High') continue;
+      const text =
+`🔔 *${countryAr} | ${ev.country}*
+${ev.event}
 
-      const when = new Date(e.date);
-      const msTo = when - now;
-      if (msTo > LEAD_MS || msTo < -5 * 60 * 1000) continue;
+⏰ ${whenLocal}${estimate}${previous}
 
-      const id = `${e.country}-${e.event}-${e.date}`;
-      const dedupeKey = `sent:${id}`;
-      const already = await kv.get(dedupeKey);
-      if (already) continue;
+💬 Reply to this message to ask the agent.`;
 
-      const country = translateCountry(e.country);
-      const whenLocal = fmtTime(when);
-      const estimate = e.estimate ? `\nEstimate | التوقع: ${e.estimate}` : '';
-      const previous = e.previous ? `\nPrevious | السابق: ${e.previous}` : '';
+      // de-dup per event for 48h (prevents re-sends across runs)
+      const dedupeKey = `sent:${ev.country}:${ev.event}:${ev.date}`;
+      if (await kv.get(dedupeKey)) continue;
 
-      const text = `🔔 *${country} | ${e.country}*\n${e.event}\n\n⏰ ${whenLocal}${estimate}${previous}`;
-      
-      for (const chat_id of validSubs) {
-        await send(BOT_TOKEN, chat_id, text);
+      if (!dry) {
+        for (const chat_id of validSubs) {
+          await send(BOT_TOKEN, chat_id, text);
+          sent++;
+        }
       }
-
-      await kv.set(dedupeKey, '1', { ex: 172800 });
-      sent++;
+      await kv.set(dedupeKey, '1', { ex: 48 * 3600 });
     }
 
-    return new Response(JSON.stringify({
+    return json({
       ok: true,
+      subs: validSubs.length,
+      events_total: events.length,
+      events_window: upcoming.length,
       sent,
-      subscribers: validSubs.length,
-      invalid_skipped: subscribers.length - validSubs.length,
-      total_events: events.length
-    }), {
-      headers: { 'content-type': 'application/json' }
+      windowMin,
+      dry
     });
 
   } catch (error) {
-    return new Response(JSON.stringify({
-      error: 'unexpected error',
-      message: error.message,
-      stack: error.stack
-    }), { 
-      status: 500,
-      headers: { 'content-type': 'application/json' }
-    });
+    return json({ ok: false, error: error?.message || 'unexpected', stack: error?.stack }, 500);
   }
 }
 
+// ---------- helpers ----------
 async function send(token, chat, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ 
-      chat_id: chat, 
-      text, 
-      parse_mode: 'Markdown',
-      disable_notification: true 
-    })
+    body: JSON.stringify({ chat_id: Number(chat), text, parse_mode: 'Markdown', disable_notification: true })
   });
 }
 
 function fmtTime(d) {
-  return new Intl.DateTimeFormat('en-GB', { 
-    dateStyle: 'medium', 
-    timeStyle: 'short', 
-    timeZone: 'Asia/Dubai' 
+  return new Intl.DateTimeFormat('en-GB', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'Asia/Dubai'
   }).format(d);
 }
 
@@ -163,4 +153,8 @@ function translateCountry(en) {
     'UK': 'المملكة المتحدة'
   };
   return map[en] || en;
+}
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 }
