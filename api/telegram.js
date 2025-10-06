@@ -21,25 +21,41 @@ export default async function handler(req) {
 
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
 
-  if (text === '/econ_on') {
-    await kv.set(`sub:${chat}`, '1');
-    await send(BOT_TOKEN, chat, '✅ تم الاشتراك في تنبيهات الأحداث الاقتصادية المهمة\n\n/econ_off لإلغاء الاشتراك\n/econ_test للتحقق من الحالة\n/econ_subs عدد المشتركين');
+  if (text === '/econ_test') {
+    await send(BOT_TOKEN, chat, '🟢 Alerts active | التنبيهات نشطة\n\nChannel: @liiratnews\nCheck interval: 5 min | الفحص كل 5 دقائق');
   }
-  else if (text === '/econ_off') {
-    await kv.del(`sub:${chat}`);
-    await send(BOT_TOKEN, chat, '❌ تم إلغاء الاشتراك');
+  else if (text === '/econ_upcoming') {
+    const today = new Date().toISOString().slice(0, 10);
+    const future = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    const url = `https://api.tradingeconomics.com/calendar/country/All/${today}/${future}?c=guest:guest&importance=3&f=json`;
+    
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      const events = await res.json();
+      
+      if (!events?.length) {
+        await send(BOT_TOKEN, chat, '📅 No high-impact events in next 7 days\nلا توجد أحداث مهمة في الأيام السبعة القادمة');
+        return new Response('ok');
+      }
+
+      const lines = ['📅 *Upcoming High-Impact Events | الأحداث الاقتصادية المهمة القادمة*\n'];
+      events.slice(0, 15).forEach((e, i) => {
+        const when = new Date(e.Date + 'Z');
+        const date = when.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'Asia/Dubai' });
+        const time = when.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Dubai' });
+        const forecast = e.Forecast ? ` | Est: ${e.Forecast}` : '';
+        lines.push(`${i + 1}. *${e.Country}*: ${e.Event}${forecast}\n   📍 ${date} at ${time}\n`);
+      });
+
+      if (events.length > 15) lines.push(`\n_+${events.length - 15} more events | المزيد من الأحداث_`);
+      
+      await send(BOT_TOKEN, chat, lines.join('\n'));
+    } catch (e) {
+      await send(BOT_TOKEN, chat, '❌ Could not fetch events | فشل جلب الأحداث');
+    }
   }
-  else if (text === '/econ_test') {
-    await send(BOT_TOKEN, chat, '🟢 البوت نشط. الفحص كل 5 دقائق للأحداث المهمة');
-  }
-  else if (text === '/econ_subs') {
-    const subKeys = await kv.keys('sub:*');
-    const count = subKeys.length;
-    const ids = subKeys.map(k => k.replace('sub:', '')).join('\n');
-    await send(BOT_TOKEN, chat, `📊 عدد المشتركين: ${count}\n\n${ids || 'لا يوجد'}`);
-  }
-  else if (text === '/start' || text === 'hi' || text === 'telegram webhook') {
-    await send(BOT_TOKEN, chat, '👋 مرحباً بك في تنبيهات liirat الاقتصادية\n\nالأوامر:\n/econ_on - اشترك\n/econ_off - إلغاء الاشتراك\n/econ_test - تحقق من الحالة\n/econ_subs - عدد المشتركين');
+  else if (text === '/start') {
+    await send(BOT_TOKEN, chat, '📊 *Economic Calendar Alerts | تنبيهات التقويم الاقتصادي*\n\n📢 Join channel for alerts:\nt.me/liiratnews\n\n*Commands | الأوامر:*\n/econ_upcoming - View events | عرض الأحداث\n/econ_test - Check status | التحقق من الحالة');
   }
 
   return new Response('ok');
@@ -51,7 +67,8 @@ async function send(token, chat, text) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ 
       chat_id: chat, 
-      text, 
+      text,
+      parse_mode: 'Markdown',
       disable_notification: true 
     })
   });
