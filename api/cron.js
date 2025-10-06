@@ -34,8 +34,9 @@ export default async function handler(req) {
     const to   = url.searchParams.get('to')   || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
     const api  = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
 
-    const r = await fetch(api, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return json({ ok: false, error: 'fmp api error', status: r.status, response: await r.text() }, 502);
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+if (!res.ok) { /* ... */ }
+events = await res.json();
 
     let events = await r.json();
     if (!Array.isArray(events)) events = [];
