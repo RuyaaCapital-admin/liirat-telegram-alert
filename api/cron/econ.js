@@ -5,7 +5,8 @@ export const config = {
   maxDuration: 60
 };
 
-const BOT_TOKEN = '8221876903:AAFdO5JtS0E4B4N5MNZ68FPo6LIzletcdME';
+const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN;
+const FMP_API_KEY = process.env.FMP_API_KEY;
 
 export default async function handler(req) {
   if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -20,29 +21,30 @@ export default async function handler(req) {
     });
   }
   
-  // Fetch upcoming high-impact events (next 30 min)
+  // Fetch upcoming high-impact events from FMP
   const now = new Date();
   const future = new Date(now.getTime() + 30 * 60000);
-  const today = now.toISOString().slice(0, 10);
-  const tomorrow = new Date(now.getTime() + 86400000).toISOString().slice(0, 10);
   
-  const url = `https://api.tradingeconomics.com/calendar/country/All/${today}/${tomorrow}?c=guest:guest&importance=3&f=json`;
+  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?apikey=${FMP_API_KEY}`;
   
   let events;
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) {
-      return new Response('API error', { status: 500 });
+      console.error('FMP API error:', res.status);
+      return new Response(JSON.stringify({ error: 'API error', status: res.status }), { status: 500 });
     }
     events = await res.json();
   } catch (e) {
-    return new Response('API timeout', { status: 500 });
+    console.error('FMP fetch failed:', e.message);
+    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
   }
 
-  // Filter for upcoming events in next 30 min
+  // Filter for upcoming events in next 30 min with high impact
   const upcoming = events.filter(e => {
-    const eventTime = new Date(e.Date + 'Z');
-    return eventTime > now && eventTime <= future && String(e.Importance ?? '3') === '3';
+    const eventTime = new Date(e.date);
+    const impact = (e.impact || '').toLowerCase();
+    return eventTime > now && eventTime <= future && impact === 'high';
   });
   
   if (!upcoming.length) {
@@ -56,20 +58,20 @@ export default async function handler(req) {
   for (const chat_id of subs) {
     for (const ev of upcoming) {
       // Check dedupe
-      const dedupeKey = `sent:${chat_id}:${ev.CalendarId || `${ev.Country}-${ev.Event}-${ev.Date}`}`;
+      const dedupeKey = `sent:${chat_id}:${ev.date}-${ev.event}`;
       const already = await kv.get(dedupeKey);
       if (already) continue;
 
-      const when = new Date(ev.Date + 'Z').toLocaleTimeString('en-GB', {
+      const when = new Date(ev.date).toLocaleTimeString('en-GB', {
         hour: '2-digit',
         minute: '2-digit',
         timeZone: 'Asia/Dubai'
       });
       
-      const forecast = ev.Forecast ? `\n📊 Forecast: ${ev.Forecast}` : '';
-      const previous = ev.Previous ? `\n📈 Previous: ${ev.Previous}` : '';
+      const estimate = ev.estimate ? `\n📊 Estimate: ${ev.estimate}` : '';
+      const previous = ev.previous ? `\n📈 Previous: ${ev.previous}` : '';
       
-      const msg = `🔔 *High-Impact Event*\n\n🌍 *${ev.Country}*\n📊 ${ev.Event}\n⏰ ${when} Dubai time${forecast}${previous}\n\n💬 _Reply to this message to ask the agent about it._`;
+      const msg = `🔔 *High-Impact Event*\n\n🌍 *${ev.country}*\n📊 ${ev.event}\n⏰ ${when} Dubai time${estimate}${previous}\n\n💬 _Reply to this message to ask the agent about it._`;
       
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
