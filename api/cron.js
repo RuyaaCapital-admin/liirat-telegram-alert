@@ -4,14 +4,15 @@ export const config = { runtime: 'edge', maxDuration: 60 };
 
 export default async function handler(req) {
   try {
-    // Auth (allow Vercel Cron or your bearer token)
+    // ---------- Auth (Vercel Cron or your Bearer secret) ----------
     const auth = req.headers.get('authorization') || '';
     const isVercelCron = req.headers.get('x-vercel-cron') === '1';
     if (!(isVercelCron || auth === `Bearer ${process.env.CRON_SECRET}`)) {
       return json({ ok: false, error: 'unauthorized' }, 401);
     }
 
-    // Use liirat bot token; fall back to legacy TG_BOT_TOKEN if set
+    // ---------- Env ----------
+    // Send with liirat bot token; fall back to legacy TG_BOT_TOKEN if set.
     const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
     const FMP_KEY   = process.env.FMP_API_KEY;
     if (!BOT_TOKEN || !FMP_KEY) {
@@ -23,66 +24,49 @@ export default async function handler(req) {
       }, 500);
     }
 
-    // Subscribers (set econ:subs with numeric chat IDs)
-    const subs = await kv.smembers('econ:subs') || [];
+    // ---------- Subscribers ----------
+    const subs = (await kv.smembers('econ:subs')) || [];
     const validSubs = subs.filter(id => /^\d+$/.test(String(id)));
     if (!validSubs.length) return json({ ok: true, sent: 0, reason: 'no valid subscribers' });
 
-    // ---- Fetch FMP calendar (today->tomorrow) ----
+    // ---------- Query params ----------
     const url = new URL(req.url);
     const from = url.searchParams.get('from') || new Date().toISOString().slice(0, 10);
     const to   = url.searchParams.get('to')   || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
-    const api  = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
+    const windowMin = Number(url.searchParams.get('minutes') || 15); // widen e.g. ?minutes=240
+    const dry       = url.searchParams.get('dry') === '1';           // ?dry=1 = compute only
 
-  let events;
-try {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort('timeout'), 8000);
+    // ---------- Fetch FMP (Edge-safe timeout) ----------
+    const api = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
+    let events;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort('timeout'), 8000);
+      const r = await fetch(api, { signal: controller.signal });
+      clearTimeout(timer);
 
-  const res = await fetch(url, { signal: controller.signal });
-  clearTimeout(t);
+      if (!r.ok) {
+        return json({ ok: false, error: 'fmp api error', status: r.status, response: await r.text() }, 502);
+      }
+      events = await r.json();
+      if (!Array.isArray(events)) events = [];
+    } catch (e) {
+      return json({ ok: false, error: 'api timeout or fetch error', message: String(e) }, 500);
+    }
 
-  if (!res.ok) {
-    const errorText = await res.text();
-    return new Response(JSON.stringify({
-      error: 'fmp api error',
-      status: res.status,
-      response: errorText
-    }), {
-      status: 502,
-      headers: { 'content-type': 'application/json' }
-    });
-  }
-  events = await res.json();
-} catch (e) {
-  return new Response(JSON.stringify({
-    error: 'api timeout or fetch error',
-    message: String(e)
-  }), {
-    status: 500,
-    headers: { 'content-type': 'application/json' }
-  });
-}
-
-
-    let events = await r.json();
-    if (!Array.isArray(events)) events = [];
-
-    // ---- Window + filtering ----
-    const windowMin = Number(url.searchParams.get('minutes') || 15);     // widen via ?minutes=240 for testing
-    const dry       = url.searchParams.get('dry') === '1';               // ?dry=1 to compute without sending
-
+    // ---------- Filter window + high impact ----------
     const now = Date.now();
-    const start = now - 5 * 60 * 1000;                     // allow late by 5 min
+    const start = now - 5 * 60 * 1000;                 // allow late by 5 min
     const end   = now + windowMin * 60 * 1000;
 
     const highImpact = v => {
-      const s = String(v || '').toLowerCase();
+      const s = String(v ?? '').toLowerCase();
       return s === 'high' || s === '3' || s === 'high impact';
     };
 
     const parseUTC = s => {
       if (!s) return null;
+      // FMP often returns "YYYY-MM-DD HH:mm:ss" with no TZ -> treat as UTC
       const d = new Date(`${String(s).replace(' ', 'T')}Z`);
       return isFinite(d) ? d : null;
     };
@@ -95,10 +79,10 @@ try {
       return t > start && t <= end;
     });
 
-    // Cache for /econ_upcoming
+    // Cache for /econ_upcoming (read by your /econ_upcoming route)
     await kv.set('econ:cache:upcoming', JSON.stringify({ at: Date.now(), items: upcoming.slice(0, 50) }), { ex: 120 });
 
-    // ---- Send ----
+    // ---------- Send ----------
     let sent = 0;
     for (const ev of upcoming) {
       const when = parseUTC(ev.date || ev.datetime || ev.Date);
@@ -115,7 +99,7 @@ ${ev.event}
 
 💬 Reply to this message to ask the agent.`;
 
-      // de-dup per event for 48h (prevents re-sends across runs)
+      // de-dup per event (48h)
       const dedupeKey = `sent:${ev.country}:${ev.event}:${ev.date}`;
       if (await kv.get(dedupeKey)) continue;
 
@@ -125,6 +109,7 @@ ${ev.event}
           sent++;
         }
       }
+
       await kv.set(dedupeKey, '1', { ex: 48 * 3600 });
     }
 
@@ -137,7 +122,6 @@ ${ev.event}
       windowMin,
       dry
     });
-
   } catch (error) {
     return json({ ok: false, error: error?.message || 'unexpected', stack: error?.stack }, 500);
   }
@@ -148,7 +132,12 @@ async function send(token, chat, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: Number(chat), text, parse_mode: 'Markdown', disable_notification: true })
+    body: JSON.stringify({
+      chat_id: Number(chat),
+      text,
+      parse_mode: 'Markdown',
+      disable_notification: true
+    })
   });
 }
 
