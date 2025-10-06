@@ -1,19 +1,16 @@
 import { kv } from '@vercel/kv';
 
 export default async function handler(req, res) {
-  // Auth: same secret you set in Vercel
-  if ((req.headers.authorization || '') !== `Bearer ${process.env.CRON_SECRET}`) {
+  if ((req.headers.authorization || '') !== `Bearer ${process.env.CRON_SECRET}`)
     return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
 
   const token = process.env.LIIRAT_BOT_TOKEN;
   if (!token) return res.status(500).json({ ok: false, error: 'LIIRAT_BOT_TOKEN missing' });
 
-  const subs = await kv.smembers<string>('econ:subs');
+  const subs = await kv.smembers('econ:subs');
   if (!subs?.length) return res.json({ ok: true, sent: 0, reason: 'no subscribers' });
 
-  const text = (req.query.text as string) || '🔔 test broadcast';
-
+  const text = req.query.text || '🔔 test broadcast';
   let sent = 0;
   for (const id of subs) {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
