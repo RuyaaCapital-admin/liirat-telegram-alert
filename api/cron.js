@@ -34,9 +34,36 @@ export default async function handler(req) {
     const to   = url.searchParams.get('to')   || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
     const api  = `https://financialmodelingprep.com/api/v3/economic_calendar?from=${from}&to=${to}&apikey=${FMP_KEY}`;
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-if (!res.ok) { /* ... */ }
-events = await res.json();
+  let events;
+try {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort('timeout'), 8000);
+
+  const res = await fetch(url, { signal: controller.signal });
+  clearTimeout(t);
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    return new Response(JSON.stringify({
+      error: 'fmp api error',
+      status: res.status,
+      response: errorText
+    }), {
+      status: 502,
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  events = await res.json();
+} catch (e) {
+  return new Response(JSON.stringify({
+    error: 'api timeout or fetch error',
+    message: String(e)
+  }), {
+    status: 500,
+    headers: { 'content-type': 'application/json' }
+  });
+}
+
 
     let events = await r.json();
     if (!Array.isArray(events)) events = [];
