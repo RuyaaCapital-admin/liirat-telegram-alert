@@ -11,6 +11,7 @@ export default async function handler(req) {
   }
 
   const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+  const CHANNEL_ID = '-1003101379630'; // @liiratnews
   
   const today = new Date().toISOString().slice(0, 10);
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
@@ -25,13 +26,9 @@ export default async function handler(req) {
   } catch (e) {
     return new Response('api timeout', { status: 500 });
   }
-  
-  const subKeys = await kv.keys('sub:*');
-  const subs = subKeys.map(k => k.replace('sub:', ''));
-  if (!subs.length) return new Response('no subs');
 
   const now = new Date();
-  const LEAD_MS = 15 * 60 * 1000;
+  const LEAD_MS = 15 * 60 * 1000; // 15 minutes
   let sent = 0;
 
   for (const e of events) {
@@ -49,22 +46,20 @@ export default async function handler(req) {
     if (already) continue;
 
     const country = translateCountry(e.Country);
-    const event = e.Event || 'حدث';
     const whenLocal = fmtTime(when);
-    const forecast = e.Forecast ? `\nالتوقع: ${e.Forecast}` : '';
-    const previous = e.Previous ? `\nالسابق: ${e.Previous}` : '';
+    const forecast = e.Forecast ? `\nForecast | التوقع: ${e.Forecast}` : '';
+    const previous = e.Previous ? `\nPrevious | السابق: ${e.Previous}` : '';
 
-    const text = `🔔 *${country}: ${event}* (مهم)\nالوقت: ${whenLocal}${forecast}${previous}`;
+    // Bilingual alert
+    const text = `🔔 *${country} | ${e.Country}*\n${e.Event}\n\n⏰ ${whenLocal}${forecast}${previous}\n\n📢 @liiratnews`;
     
-    for (const chat of subs) {
-      await send(BOT_TOKEN, chat, text);
-    }
+    await send(BOT_TOKEN, CHANNEL_ID, text);
 
     await kv.set(dedupeKey, '1', { ex: 172800 });
     sent++;
   }
 
-  return new Response(`ok - sent ${sent} alerts`);
+  return new Response(`ok - sent ${sent} alerts to channel`);
 }
 
 async function send(token, chat, text) {
@@ -81,7 +76,7 @@ async function send(token, chat, text) {
 }
 
 function fmtTime(d) {
-  return new Intl.DateTimeFormat('ar-AE', { 
+  return new Intl.DateTimeFormat('en-GB', { 
     dateStyle: 'medium', 
     timeStyle: 'short', 
     timeZone: 'Asia/Dubai' 
@@ -99,7 +94,12 @@ function translateCountry(en) {
     'France': 'فرنسا',
     'Canada': 'كندا',
     'Australia': 'أستراليا',
-    'Switzerland': 'سويسرا'
+    'Switzerland': 'سويسرا',
+    'India': 'الهند',
+    'Brazil': 'البرازيل',
+    'Mexico': 'المكسيك',
+    'South Korea': 'كوريا الجنوبية',
+    'Russia': 'روسيا'
   };
   return map[en] || en;
 }
