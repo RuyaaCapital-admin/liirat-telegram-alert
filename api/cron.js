@@ -2,6 +2,7 @@ const { kv } = require('@vercel/kv');
 
 module.exports = async function handler(req, res) {
   try {
+    // ---- auth (vercel cron or bearer) ----
     const auth = req.headers.authorization || '';
     const isCron = req.headers['x-vercel-cron'] === '1';
     if (!(isCron || auth === `Bearer ${process.env.CRON_SECRET}`)) {
@@ -11,10 +12,12 @@ module.exports = async function handler(req, res) {
     const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
     if (!BOT_TOKEN) return res.status(500).json({ ok: false, error: 'LIIRAT_BOT_TOKEN missing' });
 
+    // ---- subs ----
     const subs = (await kv.smembers('econ:subs')) || [];
     const validSubs = subs.filter((id) => /^\d+$/.test(String(id)));
     if (!validSubs.length) return res.json({ ok: true, sent: 0, reason: 'no_subscribers' });
 
+    // ---- params ----
     const baseUrl = `https://${req.headers.host || 'localhost'}`;
     const { searchParams } = new URL(req.url, baseUrl);
 
@@ -27,107 +30,134 @@ module.exports = async function handler(req, res) {
 
     const countriesParam = (searchParams.get('countries') || 'US,EA,UK')
       .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
-    const COUNTRY_MAP = { US:'United States', EA:'Euro Area', EU:'Euro Area', UK:'United Kingdom', JP:'Japan', CN:'China', CA:'Canada', AU:'Australia', CH:'Switzerland', DE:'Germany', FR:'France' };
+    const COUNTRY_MAP = {
+      US: 'United States', EA: 'Euro Area', EU: 'Euro Area', UK: 'United Kingdom',
+      JP: 'Japan', CN: 'China', CA: 'Canada', AU: 'Australia', CH: 'Switzerland',
+      DE: 'Germany', FR: 'France'
+    };
     const allowedCountries = countriesParam.map((c) => COUNTRY_MAP[c] || c);
 
     const limit = Math.max(1, Math.min(10, Number(searchParams.get('limit') || 3)));
     const dry = searchParams.get('dry') === '1';
 
+    // ---- time window ----
     const now = Date.now();
     const endTs = now + windowMin * 60 * 1000;
     const d1 = new Date(now).toISOString().slice(0, 10);
     const d2 = new Date(endTs).toISOString().slice(0, 10);
 
+    // helpers
+    const parseUTC = (s) => {
+      if (!s) return null;
+      let d = new Date(s);
+      if (!isFinite(d)) d = new Date(String(s).replace(' ', 'T') + 'Z');
+      return isFinite(d) ? d : null;
+    };
+    const isHighOrMed = (imp) => {
+      const s = String(imp ?? '').toLowerCase();
+      return s === '3' || s === 'high' || s === '2' || s === 'medium';
+    };
+    const MAJOR_KEYS = [
+      'non-farm payroll', 'nfp', 'fomc', 'fed interest rate', 'federal funds rate',
+      'interest rate decision', 'ecb interest rate', 'boe interest rate',
+      'bank of england interest rate', 'cpi', 'consumer price index',
+      'core cpi', 'inflation rate', 'unemployment rate'
+    ];
+    const isMajor = (name) => {
+      const s = String(name || '').toLowerCase();
+      return MAJOR_KEYS.some((k) => s.includes(k));
+    };
+    const normalizeTE = (row) => ({
+      country: row.Country,
+      event: row.Event,
+      date: row.Date,
+      forecast: row.Forecast,
+      previous: row.Previous,
+      importance: row.Importance || row.Impact
+    });
+
+    // ---- try TradingEconomics guest; fallback to manual KV ----
     let source = 'te';
     let raw = [];
 
-    // ---- Try TradingEconomics (guest) ----
     try {
       const teKey = process.env.TE_API_KEY || 'guest:guest';
       const base = `importance=2,3&c=${encodeURIComponent(teKey)}&f=json`;
       const urls = [
         `https://api.tradingeconomics.com/calendar?d1=${d1}&d2=${d2}&${base}`,
-        `https://api.tradingeconomics.com/calendar?${base}`,
+        `https://api.tradingeconomics.com/calendar?${base}`, // broader, if date window fails
       ];
       for (const u of urls) {
         try {
-          const ac = new AbortController(); const t = setTimeout(() => ac.abort(), 8000);
+          const ac = new AbortController();
+          const t = setTimeout(() => ac.abort(), 8000);
           const r = await fetch(u, { signal: ac.signal, headers: { accept: 'application/json' } });
           clearTimeout(t);
           if (r.ok) {
             const j = await r.json();
             if (Array.isArray(j) && j.length) { raw = j; break; }
           }
-        } catch (_) {}
+        } catch (_) { /* ignore */ }
       }
-    } catch (_) {}
+    } catch (_) { /* ignore */ }
 
-    const parseUTC = (s) => { if (!s) return null; let d = new Date(s); if (!isFinite(d)) d = new Date(String(s).replace(' ','T')+'Z'); return isFinite(d) ? d : null; };
-    const isHighOrMed = (imp) => { const s = String(imp ?? '').toLowerCase(); return s==='3'||s==='high'||s==='2'||s==='medium'; };
-    const MAJOR_KEYS = ['non-farm payroll','nfp','fomc','fed interest rate','federal funds rate','interest rate decision','ecb interest rate','boe interest rate','bank of england interest rate','cpi','consumer price index','core cpi','inflation rate','unemployment rate'];
-    const isMajor = (name) => { const s = String(name||'').toLowerCase(); return MAJOR_KEYS.some((k) => s.includes(k)); };
-    const normalizeTE = (row) => ({ country: row.Country, event: row.Event, date: row.Date, forecast: row.Forecast, previous: row.Previous, importance: row.Importance || row.Impact });
-
-    // ---- MANUAL fallback (read events scheduled in KV within [now, endTs]) ----
-source = 'manual';
-
-let manual = [];
-try {
-  // Try SDK first
-  manual = await kv.zrange('econ:manual', `${now}`, `${endTs}`, { byScore: true });
-  if (!manual || manual.length === 0) throw new Error('empty'); // force REST fallback if empty
-} catch (_) {
-  // Guaranteed fallback via Upstash REST
-  const url = `${process.env.KV_REST_API_URL}/zrange/econ:manual/${now}/${endTs}?byScore=true`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}` } });
-  manual = r.ok ? await r.json() : [];
-}
-
-events = manual
-  .map(m => { try { return JSON.parse(m); } catch { return null; } })
-  .filter(Boolean)
-  .map(e => ({
-    country: e.country,
-    event:   e.event,
-    date:    e.date,
-    forecast: e.forecast ?? null,
-    previous: e.previous ?? null,
-    importance: '3', // treat manual as high-impact
-  }));
-
-        // REST fallback (works on all @vercel/kv versions)
+    let events = [];
+    if (Array.isArray(raw) && raw.length) {
+      events = raw.map(normalizeTE);
+    } else {
+      // ---- MANUAL fallback from Upstash KV sorted-set econ:manual ----
+      source = 'manual';
+      let manual = [];
+      try {
+        // try SDK first
+        manual = await kv.zrange('econ:manual', `${now}`, `${endTs}`, { byScore: true });
+        if (!manual || manual.length === 0) throw new Error('empty');
+      } catch (_) {
+        // REST fallback (works on any SDK version)
         const url = `${process.env.KV_REST_API_URL}/zrange/econ:manual/${now}/${endTs}?byScore=true`;
         const r = await fetch(url, { headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}` } });
         manual = r.ok ? await r.json() : [];
       }
-      events = manual.map((m) => { try { return JSON.parse(m); } catch { return null; } })
+
+      events = manual
+        .map((m) => { try { return JSON.parse(m); } catch { return null; } })
         .filter(Boolean)
-        .map((e) => ({ country:e.country, event:e.event, date:e.date, forecast:e.forecast ?? null, previous:e.previous ?? null, importance:'3' }));
+        .map((e) => ({
+          country: e.country,
+          event: e.event,
+          date: e.date,
+          forecast: e.forecast ?? null,
+          previous: e.previous ?? null,
+          importance: '3' // treat manual as high-impact
+        }));
     }
 
-    // ---- Filter + limit ----
-    const filtered = events.filter((e) => {
-      if (!e || !e.country || !e.event || !e.date) return false;
-      if (majorOnly && !isMajor(e.event)) return false;
-      if (!allowedCountries.includes(e.country)) return false;
-      const d = parseUTC(e.date); if (!d) return false;
-      const ts = d.getTime();
-      return ts >= now && ts <= endTs && isHighOrMed(e.importance);
-    }).sort((a,b) => new Date(a.date) - new Date(b.date)).slice(0, limit);
+    // ---- filter & limit ----
+    const filtered = events
+      .filter((e) => {
+        if (!e || !e.country || !e.event || !e.date) return false;
+        if (majorOnly && !isMajor(e.event)) return false;
+        if (!allowedCountries.includes(e.country)) return false;
+        const d = parseUTC(e.date); if (!d) return false;
+        const ts = d.getTime();
+        return ts >= now && ts <= endTs && isHighOrMed(e.importance);
+      })
+      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .slice(0, limit);
 
+    // cache last preview (optional)
     await kv.set('econ:cache:upcoming', JSON.stringify({ at: Date.now(), items: filtered }), { ex: 120 });
 
-    // ---- Send ----
+    // ---- send ----
     let sent = 0;
     for (const ev of filtered) {
       const when = parseUTC(ev.date);
       const whenLocal = when
-        ? new Intl.DateTimeFormat('en-GB', { dateStyle:'medium', timeStyle:'short', timeZone:'Asia/Dubai' }).format(when)
+        ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Dubai' }).format(when)
         : '—';
       const estimate = ev.forecast ? `\nForecast: ${ev.forecast}` : '';
       const previous = ev.previous ? `\nPrevious: ${ev.previous}` : '';
-      const text =
-`🔔 *${translateCountry(ev.country)} | ${ev.country}*
+      const text = `🔔 *${translateCountry(ev.country)} | ${ev.country}*
 ${ev.event}
 
 ⏰ ${whenLocal}${estimate}${previous}
@@ -142,7 +172,12 @@ ${ev.event}
           await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chat_id: Number(chat_id), text, parse_mode:'Markdown', disable_notification:true })
+            body: JSON.stringify({
+              chat_id: Number(chat_id),
+              text,
+              parse_mode: 'Markdown',
+              disable_notification: true
+            })
           });
         }
         sent += validSubs.length;
@@ -161,6 +196,12 @@ ${ev.event}
 };
 
 function translateCountry(en) {
-  const map = {'United States':'الولايات المتحدة','Euro Area':'منطقة اليورو','United Kingdom':'المملكة المتحدة','China':'الصين','Japan':'اليابان','Germany':'ألمانيا','France':'فرنسا','Canada':'كندا','Australia':'أستراليا','Switzerland':'سويسرا','India':'الهند','Brazil':'البرازيل','Mexico':'المكسيك','South Korea':'كوريا الجنوبية','Russia':'روسيا','US':'الولايات المتحدة','UK':'المملكة المتحدة'};
+  const map = {
+    'United States': 'الولايات المتحدة', 'Euro Area': 'منطقة اليورو', 'United Kingdom': 'المملكة المتحدة',
+    'China': 'الصين', 'Japan': 'اليابان', 'Germany': 'ألمانيا', 'France': 'فرنسا', 'Canada': 'كندا',
+    'Australia': 'أستراليا', 'Switzerland': 'سويسرا', 'India': 'الهند', 'Brazil': 'البرازيل',
+    'Mexico': 'المكسيك', 'South Korea': 'كوريا الجنوبية', 'Russia': 'روسيا', 'US': 'الولايات المتحدة',
+    'UK': 'المملكة المتحدة'
+  };
   return map[en] || en;
 }
