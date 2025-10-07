@@ -45,40 +45,61 @@ export default async function handler(req, res) {
     const d1 = new Date(now).toISOString().slice(0, 10);
     const d2 = new Date(endTs).toISOString().slice(0, 10);
 
-    // ---- TE fetch with fallback (range → no-range) ----
-    const teKey = process.env.TE_API_KEY || 'guest:guest';
-    const baseParams = `importance=2,3&c=${encodeURIComponent(teKey)}&format=json`;
-    const teUrls = [
-      `https://api.tradingeconomics.com/calendar?d1=${d1}&d2=${d2}&${baseParams}`,
-      `https://api.tradingeconomics.com/calendar?${baseParams}`
-    ];
+ // ---- TE fetch with fallback (range → no-range). Be tolerant to TE outages. ----
+const teKey = process.env.TE_API_KEY || 'guest:guest';
+// TE prefers `f=json` (not format=)
+const baseParams = `importance=2,3&c=${encodeURIComponent(teKey)}&f=json`;
+const teUrls = [
+  `https://api.tradingeconomics.com/calendar?d1=${d1}&d2=${d2}&${baseParams}`,
+  `https://api.tradingeconomics.com/calendar?${baseParams}`
+];
 
-    let raw = [];
-    let teStatus = null, teBody = null;
+let raw = [];
+let teStatus = null, teBody = null;
 
-    for (const u of teUrls) {
-      try {
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 8000);
-        const r = await fetch(u, { signal: controller.signal });
-        clearTimeout(t);
-        teStatus = r.status;
-        if (r.ok) {
-          const json = await r.json();
-          if (Array.isArray(json) && json.length) { raw = json; break; }
-        } else {
-          teBody = await r.text();
-        }
-      } catch (e) {
-        teBody = String(e);
-      }
+for (const u of teUrls) {
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 8000);
+    const r = await fetch(u, {
+      signal: ac.signal,
+      headers: { 'accept': 'application/json' }
+    });
+    clearTimeout(t);
+
+    teStatus = r.status;
+
+    if (r.ok) {
+      const json = await r.json();
+      if (Array.isArray(json) && json.length) { raw = json; break; }
+      // If empty array, try next URL
+    } else {
+      teBody = await r.text();
     }
+  } catch (e) {
+    teBody = String(e);
+  }
+}
 
-    if (!Array.isArray(raw) || !raw.length) {
-      return res.status(502).json({
-        ok: false, error: 'te api error', status: teStatus, response: teBody, tried: teUrls
-      });
-    }
+// If TE is down, don't fail cron; just report no send.
+if (!Array.isArray(raw) || !raw.length) {
+  return res.json({
+    ok: true,
+    source: 'te',
+    subs: validSubs.length,
+    events_total: 0,
+    events_after_filters: 0,
+    sent: 0,
+    windowMin,
+    mode,
+    countries: allowedCountries,
+    limit,
+    dry,
+    reason: 'tradingeconomics_unavailable',
+    teStatus,
+    teBody
+  });
+}
 
     // ---- Normalize & filters ----
     const parseUTC = (s) => {
