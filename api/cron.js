@@ -55,32 +55,49 @@ export default async function handler(req, res) {
 
     const dry = searchParams.get('dry') === '1'; // compute only, no send
 
-    // ---- Fetch TradingEconomics with date range ----
-    const now = Date.now();
-    const endTs = now + windowMin * 60 * 1000;
+   // ---- TE fetch with fallback ----
+const teKey = process.env.TE_API_KEY || 'guest:guest';
+const baseParams = `importance=2,3&c=${encodeURIComponent(teKey)}&format=json`;
+const teUrls = [
+  // try date range first
+  `https://api.tradingeconomics.com/calendar?d1=${d1}&d2=${d2}&${baseParams}`,
+  // fallback if TE throws 500 on d1/d2 (guest accounts often do)
+  `https://api.tradingeconomics.com/calendar?${baseParams}`
+];
 
-    const d1 = new Date(now).toISOString().slice(0, 10);
-    const d2 = new Date(endTs).toISOString().slice(0, 10);
+let raw = [];
+let teStatus = null, teBody = null;
 
-    const teKey = process.env.TE_API_KEY || 'guest:guest';
-    const teUrl =
-      `https://api.tradingeconomics.com/calendar?d1=${d1}&d2=${d2}` +
-      `&importance=2,3&c=${encodeURIComponent(teKey)}&f=json`;
+for (const u of teUrls) {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch(u, { signal: controller.signal });
+    clearTimeout(t);
 
-    let raw = [];
-    try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 8000);
-      const r = await fetch(teUrl, { signal: controller.signal });
-      clearTimeout(t);
-      if (!r.ok) {
-        return res.status(502).json({ ok: false, error: 'te api error', status: r.status, response: await r.text() });
-      }
-      raw = await r.json();
-      if (!Array.isArray(raw)) raw = [];
-    } catch (e) {
-      return res.status(500).json({ ok: false, error: 'te fetch error', message: String(e) });
+    teStatus = r.status;
+
+    if (r.ok) {
+      const json = await r.json();
+      if (Array.isArray(json) && json.length) { raw = json; break; }
+      // if empty, try next URL
+    } else {
+      teBody = await r.text();
     }
+  } catch (e) {
+    teBody = String(e);
+  }
+}
+
+if (!Array.isArray(raw) || !raw.length) {
+  return res.status(502).json({
+    ok: false,
+    error: 'te api error',
+    status: teStatus,
+    response: teBody,
+    tried: teUrls
+  });
+}
 
     // ---- Normalize & filter ----
     const parseUTC = (s) => {
