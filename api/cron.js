@@ -76,15 +76,25 @@ export default async function handler(req, res) {
       events = raw.map(normalizeTE);
     } else {
       source = 'manual';
-      // fetch manual events within window [now, endTs]
-      const manual = await kv.zrangebyscore('econ:manual', now, endTs);
-      events = manual.map(m => {
-        try { return JSON.parse(m); } catch { return null; }
-      }).filter(Boolean).map(e => ({
-        country: e.country, event: e.event, date: e.date,
-        forecast: e.forecast ?? null, previous: e.previous ?? null, importance: '3'
-      }));
-    }
+     // ---- MANUAL fallback (read events scheduled in KV within [now, endTs]) ----
+source = 'manual';
+
+// ⛔ old (remove): const manual = await kv.zrangebyscore('econ:manual', now, endTs);
+// ✅ correct:
+const manual = await kv.zrange('econ:manual', now, endTs, { byScore: true });
+
+events = manual
+  .map((m) => { try { return JSON.parse(m); } catch { return null; } })
+  .filter(Boolean)
+  .map((e) => ({
+    country: e.country,
+    event:   e.event,
+    date:    e.date,
+    forecast: e.forecast ?? null,
+    previous: e.previous ?? null,
+    importance: '3', // treat manual as high-impact
+  }));
+
 
     // Filter: importance, country, window
     const filtered = events.filter(e => {
