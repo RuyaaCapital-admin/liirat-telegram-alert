@@ -1,7 +1,6 @@
-// api/cron.js - Economic calendar alerts with live provider support
+// api/cron.js - Economic calendar alerts with Trading Economics API
 // Auto-triggers: Runs every 5 min, sends alerts 5-60 min before events
-// Real data from Finnhub (primary) or FMP (fallback)
-// Manual events (econ:manual) always merged as override layer
+// Real data from Trading Economics (primary) or Manual (fallback)
 
 'use strict';
 
@@ -12,104 +11,72 @@ const { kv } = require('@vercel/kv');
 // ============================================================================
 
 /**
- * Fetch events from Finnhub
- * Free tier: 60 calls/min, economic calendar included
- * Endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD
+ * Fetch events from Trading Economics
+ * Endpoint: /calendar
+ * Docs: https://docs.tradingeconomics.com/#economic-calendar
  */
-async function fetchFinnhub(fromMs, toMs) {
-  const key = process.env.FINNHUB_API_KEY;
+async function fetchTradingEconomics(fromMs, toMs) {
+  const key = process.env.TRADING_ECONOMICS_API_KEY;
   if (!key) return null;
 
   const from = new Date(fromMs).toISOString().split('T')[0];
   const to = new Date(toMs).toISOString().split('T')[0];
-  const url = `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${key}`;
+  
+  // Trading Economics format: client_key:secret_key
+  const url = `https://api.tradingeconomics.com/calendar?c=${key}&d1=${from}&d2=${to}&f=json`;
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const data = await res.json();
-    
-    // Finnhub returns { economicCalendar: [{time, country, event, actual, estimate, prev, impact}] }
-    const events = data.economicCalendar || [];
-    
-    return events.map(e => ({
-      country: normalizeCountry(e.country),
-      event: e.event || 'Unknown Event',
-      date: new Date(e.time * 1000).toISOString(), // Unix timestamp to ISO
-      forecast: e.estimate || null,
-      previous: e.prev || null,
-      impact: e.impact || 'unknown'
-    })).filter(e => e.country); // Drop events with unmapped countries
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fetch events from Financial Modeling Prep
- * Note: Free tier may block this endpoint (403)
- * Endpoint: /economic_calendar
- */
-async function fetchFMP(fromMs, toMs) {
-  const key = process.env.FMP_API_KEY;
-  if (!key) return null;
-
-  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?apikey=${key}`;
-
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
     if (!res.ok) return null;
     const events = await res.json();
     
-    // FMP returns [{date, country, event, estimate, previous, impact}]
-    return events
-      .filter(e => {
-        const ts = Date.parse(e.date);
-        return ts >= fromMs && ts <= toMs;
-      })
-      .map(e => ({
-        country: normalizeCountry(e.country),
-        event: e.event || 'Unknown Event',
-        date: new Date(e.date).toISOString(),
-        forecast: e.estimate || null,
-        previous: e.previous || null,
-        impact: e.impact || 'unknown'
-      }))
-      .filter(e => e.country);
-  } catch {
+    // Trading Economics returns: [{
+    //   Country, Event, Date (ISO), Forecast, Previous, TEForecast, Actual, Importance
+    // }]
+    return events.map(e => ({
+      country: normalizeCountry(e.Country),
+      event: e.Event || 'Unknown Event',
+      date: e.Date, // Already ISO format
+      forecast: e.Forecast || e.TEForecast || null,
+      previous: e.Previous || null,
+      impact: mapImportance(e.Importance)
+    })).filter(e => e.country);
+  } catch (err) {
+    console.error('Trading Economics fetch failed:', err.message);
     return null;
   }
 }
 
 /**
- * Normalize country codes to full names
- * Maps common codes (US, GB, EA, EU, JP, CN, DE) to display names
+ * Map Trading Economics Importance (1-3) to impact level
+ * 1 = Low, 2 = Medium, 3 = High
  */
-function normalizeCountry(code) {
+function mapImportance(importance) {
+  if (importance === 3) return 'high';
+  if (importance === 2) return 'medium';
+  return 'low';
+}
+
+/**
+ * Normalize country names
+ */
+function normalizeCountry(name) {
   const map = {
-    'US': 'United States',
-    'USA': 'United States',
     'United States': 'United States',
-    'EA': 'Euro Area',
-    'EU': 'Euro Area',
-    'EUR': 'Euro Area',
     'Euro Area': 'Euro Area',
-    'Eurozone': 'Euro Area',
-    'GB': 'United Kingdom',
-    'UK': 'United Kingdom',
     'United Kingdom': 'United Kingdom',
-    'JP': 'Japan',
-    'JPN': 'Japan',
     'Japan': 'Japan',
-    'CN': 'China',
-    'CHN': 'China',
     'China': 'China',
-    'DE': 'Germany',
-    'DEU': 'Germany',
-    'Germany': 'Germany'
+    'Germany': 'Germany',
+    'France': 'France',
+    'Canada': 'Canada',
+    'Australia': 'Australia',
+    'Switzerland': 'Switzerland',
+    'India': 'India',
+    'Brazil': 'Brazil'
   };
   
-  return map[code] || map[String(code).toUpperCase()] || null;
+  return map[name] || null;
 }
 
 /**
@@ -162,11 +129,10 @@ module.exports = async function handler(req, res) {
     const minutes = q.get('minutes') ? Number(q.get('minutes')) : null;
     const days = q.get('days') ? Number(q.get('days')) : null;
     const limit = q.get('limit') ? Math.max(1, Number(q.get('limit'))) : 10;
-    const langParam = (q.get('lang') || 'both').toLowerCase(); // 'en' | 'ar' | 'both' | 'bi'
-    const source = (q.get('source') || 'provider').toLowerCase(); // 'provider' | 'manual'
+    const langParam = (q.get('lang') || 'both').toLowerCase();
+    const source = (q.get('source') || 'provider').toLowerCase();
 
-    // Default: alert window 5-60 min (auto-trigger before events)
-    // Cron runs every 5 min, so events 5-60 min away get alerted
+    // Default: alert window 5-60 min
     const windowMin = minutes ?? (days ? days * 1440 : 60);
     const now = Date.now();
     const end = now + windowMin * 60 * 1000;
@@ -186,30 +152,24 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ---- Fetch Events from Provider or Manual -------------------------------
+    // ---- Fetch Events -------------------------------------------------------
     let providerEvents = [];
     let manualEvents = [];
     let providerUsed = 'none';
 
     if (source === 'provider') {
-      // Try Finnhub first, then FMP
-      providerEvents = await fetchFinnhub(now, end);
+      providerEvents = await fetchTradingEconomics(now, end);
       if (providerEvents && providerEvents.length > 0) {
-        providerUsed = 'finnhub';
+        providerUsed = 'tradingeconomics';
       } else {
-        providerEvents = await fetchFMP(now, end);
-        if (providerEvents && providerEvents.length > 0) {
-          providerUsed = 'fmp';
-        } else {
-          providerEvents = [];
-        }
+        providerEvents = [];
       }
     }
 
-    // Always merge manual events (override layer)
+    // Always merge manual events
     manualEvents = await fetchManual(now, end);
 
-    // Combine and deduplicate by country+event+date
+    // Combine and deduplicate
     const combined = [...providerEvents, ...manualEvents];
     const uniqueMap = new Map();
     for (const ev of combined) {
@@ -234,12 +194,10 @@ module.exports = async function handler(req, res) {
     }).slice(0, limit);
 
     // ---- Cache for /api/econ/upcoming ---------------------------------------
-    // Cache next 24h events (not just alert window) so /econ_upcoming shows more
     const cacheEnd = now + 24 * 60 * 60 * 1000;
     let cacheEvents = [];
     if (source === 'provider') {
-      let provCache = await fetchFinnhub(now, cacheEnd);
-      if (!provCache || !provCache.length) provCache = await fetchFMP(now, cacheEnd);
+      let provCache = await fetchTradingEconomics(now, cacheEnd);
       cacheEvents = [...(provCache || []), ...(await fetchManual(now, cacheEnd))];
     } else {
       cacheEvents = await fetchManual(now, cacheEnd);
@@ -272,6 +230,15 @@ module.exports = async function handler(req, res) {
     }
 
     // ---- Message Formatting -------------------------------------------------
+    const countryFlags = {
+      'United States': '🇺🇸',
+      'Euro Area': '🇪🇺',
+      'United Kingdom': '🇬🇧',
+      'Japan': '🇯🇵',
+      'China': '🇨🇳',
+      'Germany': '🇩🇪'
+    };
+    
     const countryAr = {
       'United States': 'الولايات المتحدة',
       'Euro Area': 'منطقة اليورو',
@@ -286,31 +253,21 @@ module.exports = async function handler(req, res) {
     });
 
     function toMsg(ev) {
-      const when = fmtEn.format(new Date(ev.ts)) + ' (Asia/Dubai)';
+      const when = fmtEn.format(new Date(ev.ts));
+      const flag = countryFlags[ev.country] || '🌐';
       const countryEn = ev.country;
-      const countryArName = countryAr[ev.country] || ev.country;
       const eventName = ev.event;
       const forecast = ev.forecast;
       const previous = ev.previous;
 
-      if (langParam === 'ar') {
-        let txt = `🔔 ${countryArName}: ${eventName}\n⏰ ${when}`;
-        if (forecast) txt += `\nالتوقع: ${forecast}`;
-        if (previous) txt += `\nالسابق: ${previous}`;
-        return txt;
-      }
-      if (langParam === 'both' || langParam === 'bi') {
-        const lines = [];
-        lines.push(`🔔 ${countryArName}: ${eventName} | ${countryEn}: ${eventName}`);
-        lines.push(`⏰ ${when}`);
-        if (forecast) lines.push(`التوقع: ${forecast} | Forecast: ${forecast}`);
-        if (previous) lines.push(`السابق: ${previous} | Previous: ${previous}`);
-        return lines.join('\n');
-      }
-      let txt = `🔔 ${countryEn}: ${eventName}\n⏰ ${when}`;
-      if (forecast) txt += `\nForecast: ${forecast}`;
-      if (previous) txt += `\nPrevious: ${previous}`;
-      return txt;
+      // Match your screenshot format
+      const lines = [];
+      lines.push(`${flag} ${countryEn}: ${eventName}`);
+      lines.push(`⏰ ${when} (Asia/Dubai)`);
+      if (forecast) lines.push(`Forecast: ${forecast}`);
+      if (previous) lines.push(`Previous: ${previous}`);
+      
+      return lines.join('\n');
     }
 
     // ---- Deduplication & Sending --------------------------------------------
@@ -332,7 +289,7 @@ module.exports = async function handler(req, res) {
           await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+            body: JSON.stringify({ chat_id: chatId, text })
           });
           sent++;
         }
