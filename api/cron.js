@@ -1,82 +1,133 @@
-// api/cron.js
-//
-// This handler drives the scheduled delivery of economic alerts.  It reads upcoming
-// events from a Redis sorted set, filters them by a rolling window and a set of
-// countries/keywords, caches the next few items for the `/api/econ/upcoming`
-// endpoint and then broadcasts formatted messages to all subscribers.  A simple
-// deduplication layer prevents the same alert from being sent twice in the
-// same minute across multiple cron executions.  Messages can be rendered in
-// English, Arabic or bilingual form by supplying `?lang=en`, `?lang=ar` or
-// `?lang=both`.
+// api/cron.js - Economic calendar alerts with live provider support
+// Auto-triggers: Runs every 5 min, sends alerts 5-60 min before events
+// Real data from Finnhub (primary) or FMP (fallback)
+// Manual events (econ:manual) always merged as override layer
 
 'use strict';
 
 const { kv } = require('@vercel/kv');
 
-module.exports = async function handler(req, res) {
+// ============================================================================
+// PROVIDER ADAPTERS
+// ============================================================================
+
+/**
+ * Fetch events from Finnhub
+ * Free tier: 60 calls/min, economic calendar included
+ * Endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD
+ */
+async function fetchFinnhub(fromMs, toMs) {
+  const key = process.env.FINNHUB_API_KEY;
+  if (!key) return null;
+
+  const from = new Date(fromMs).toISOString().split('T')[0];
+  const to = new Date(toMs).toISOString().split('T')[0];
+  const url = `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${key}`;
+
   try {
-    // ---- authentication -----------------------------------------------------
-    // Require the cron secret on every invocation.  Vercel Cron attaches
-    // Authorization: Bearer <CRON_SECRET> automatically.  Reject anything
-    // else to prevent abuse.
-    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    
+    // Finnhub returns { economicCalendar: [{time, country, event, actual, estimate, prev, impact}] }
+    const events = data.economicCalendar || [];
+    
+    return events.map(e => ({
+      country: normalizeCountry(e.country),
+      event: e.event || 'Unknown Event',
+      date: new Date(e.time * 1000).toISOString(), // Unix timestamp to ISO
+      forecast: e.estimate || null,
+      previous: e.prev || null,
+      impact: e.impact || 'unknown'
+    })).filter(e => e.country); // Drop events with unmapped countries
+  } catch {
+    return null;
+  }
+}
 
-    // ---- parameter parsing --------------------------------------------------
-    const q = new URL(req.url, 'http://x').searchParams;
-    const dry    = ['1', 'true'].includes((q.get('dry') || '').toLowerCase());
-    const mode   = (q.get('mode') || 'major').toLowerCase(); // 'major' | 'all'
-    const minutes = q.get('minutes') ? Number(q.get('minutes')) : null;
-    const days    = q.get('days') ? Number(q.get('days')) : null;
-    const limit   = q.get('limit') ? Math.max(1, Number(q.get('limit'))) : 5;
-    const langParam = (q.get('lang') || 'en').toLowerCase(); // 'en' | 'ar' | 'both' | 'bi'
+/**
+ * Fetch events from Financial Modeling Prep
+ * Note: Free tier may block this endpoint (403)
+ * Endpoint: /economic_calendar
+ */
+async function fetchFMP(fromMs, toMs) {
+  const key = process.env.FMP_API_KEY;
+  if (!key) return null;
 
-    // Determine the look‑ahead window.  If minutes is supplied use it,
-    // otherwise convert days into minutes.  Fall back to 24h.
-    const windowMin = minutes ?? (days ? days * 1440 : 1440);
-    const now = Date.now();
-    const end = now + windowMin * 60 * 1000;
+  const url = `https://financialmodelingprep.com/api/v3/economic_calendar?apikey=${key}`;
 
-    // Bot token may live in either LIIRAT_BOT_TOKEN or TG_BOT_TOKEN.  Abort if
-    // neither is set.  It is important not to leak the actual token string.
-    const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
-    if (!BOT_TOKEN) {
-      return res.status(500).json({ ok: false, error: 'missing_bot_token' });
-    }
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const events = await res.json();
+    
+    // FMP returns [{date, country, event, estimate, previous, impact}]
+    return events
+      .filter(e => {
+        const ts = Date.parse(e.date);
+        return ts >= fromMs && ts <= toMs;
+      })
+      .map(e => ({
+        country: normalizeCountry(e.country),
+        event: e.event || 'Unknown Event',
+        date: new Date(e.date).toISOString(),
+        forecast: e.estimate || null,
+        previous: e.previous || null,
+        impact: e.impact || 'unknown'
+      }))
+      .filter(e => e.country);
+  } catch {
+    return null;
+  }
+}
 
-    // ---- load subscribers ---------------------------------------------------
-    // Subscribers are stored in a set of string chat IDs.  Remove anything
-    // that doesn’t look numeric for safety.
-    const subs = (await kv.smembers('econ:subs')) || [];
-    const validSubs = subs.filter(x => /^\d+$/.test(String(x)));
-    if (!validSubs.length) {
-      return res.json({
-        ok: true, source: 'manual', subs: 0, events_total: 0,
-        events_after_filters: 0, sent: 0, windowMin, mode, limit, dry
-      });
-    }
+/**
+ * Normalize country codes to full names
+ * Maps common codes (US, GB, EA, EU, JP, CN, DE) to display names
+ */
+function normalizeCountry(code) {
+  const map = {
+    'US': 'United States',
+    'USA': 'United States',
+    'United States': 'United States',
+    'EA': 'Euro Area',
+    'EU': 'Euro Area',
+    'EUR': 'Euro Area',
+    'Euro Area': 'Euro Area',
+    'Eurozone': 'Euro Area',
+    'GB': 'United Kingdom',
+    'UK': 'United Kingdom',
+    'United Kingdom': 'United Kingdom',
+    'JP': 'Japan',
+    'JPN': 'Japan',
+    'Japan': 'Japan',
+    'CN': 'China',
+    'CHN': 'China',
+    'China': 'China',
+    'DE': 'Germany',
+    'DEU': 'Germany',
+    'Germany': 'Germany'
+  };
+  
+  return map[code] || map[String(code).toUpperCase()] || null;
+}
 
-    // ---- read scheduled events from Redis ----------------------------------
-    // Upstash KV occasionally behaves differently depending on the client
-    // version.  Attempt to fetch by index first, fall back to a large slice
-    // and finally by score if supported.
+/**
+ * Fetch events from manual storage (admin-inserted test events)
+ */
+async function fetchManual(fromMs, toMs) {
+  try {
     let raw = await kv.zrange('econ:manual', 0, -1);
-    let readMode = 'index';
     if (!raw || !raw.length) {
       raw = await kv.zrange('econ:manual', 0, 99999);
-      readMode = 'index_fallback';
     }
     if (!raw || !raw.length) {
       try {
         raw = await kv.zrange('econ:manual', '-inf', '+inf', { byScore: true });
-        readMode = 'score';
-      } catch {
-        // older SDKs may not support byScore, ignore any error
-      }
+      } catch {}
     }
 
-    const all = (raw || [])
+    return (raw || [])
       .map(s => {
         try {
           const o = typeof s === 'string' ? JSON.parse(s) : s;
@@ -87,75 +138,153 @@ module.exports = async function handler(req, res) {
         }
       })
       .filter(Boolean)
-      .sort((a, b) => a.ts - b.ts);
+      .filter(e => e.ts >= fromMs && e.ts <= toMs);
+  } catch {
+    return [];
+  }
+}
 
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
+
+module.exports = async function handler(req, res) {
+  try {
+    // ---- Authentication -----------------------------------------------------
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    // ---- Parameter Parsing --------------------------------------------------
+    const q = new URL(req.url, 'http://x').searchParams;
+    const dry = ['1', 'true'].includes((q.get('dry') || '').toLowerCase());
+    const mode = (q.get('mode') || 'major').toLowerCase(); // 'major' | 'all'
+    const minutes = q.get('minutes') ? Number(q.get('minutes')) : null;
+    const days = q.get('days') ? Number(q.get('days')) : null;
+    const limit = q.get('limit') ? Math.max(1, Number(q.get('limit'))) : 10;
+    const langParam = (q.get('lang') || 'both').toLowerCase(); // 'en' | 'ar' | 'both' | 'bi'
+    const source = (q.get('source') || 'provider').toLowerCase(); // 'provider' | 'manual'
+
+    // Default: alert window 5-60 min (auto-trigger before events)
+    // Cron runs every 5 min, so events 5-60 min away get alerted
+    const windowMin = minutes ?? (days ? days * 1440 : 60);
+    const now = Date.now();
+    const end = now + windowMin * 60 * 1000;
+
+    const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+    if (!BOT_TOKEN) {
+      return res.status(500).json({ ok: false, error: 'missing_bot_token' });
+    }
+
+    // ---- Load Subscribers ---------------------------------------------------
+    const subs = (await kv.smembers('econ:subs')) || [];
+    const validSubs = subs.filter(x => /^\d+$/.test(String(x)));
+    if (!validSubs.length) {
+      return res.json({
+        ok: true, source: 'none', subs: 0, events_total: 0,
+        events_after_filters: 0, sent: 0, windowMin, mode, limit, dry
+      });
+    }
+
+    // ---- Fetch Events from Provider or Manual -------------------------------
+    let providerEvents = [];
+    let manualEvents = [];
+    let providerUsed = 'none';
+
+    if (source === 'provider') {
+      // Try Finnhub first, then FMP
+      providerEvents = await fetchFinnhub(now, end);
+      if (providerEvents && providerEvents.length > 0) {
+        providerUsed = 'finnhub';
+      } else {
+        providerEvents = await fetchFMP(now, end);
+        if (providerEvents && providerEvents.length > 0) {
+          providerUsed = 'fmp';
+        } else {
+          providerEvents = [];
+        }
+      }
+    }
+
+    // Always merge manual events (override layer)
+    manualEvents = await fetchManual(now, end);
+
+    // Combine and deduplicate by country+event+date
+    const combined = [...providerEvents, ...manualEvents];
+    const uniqueMap = new Map();
+    for (const ev of combined) {
+      const key = `${ev.country}|${ev.event}|${new Date(ev.date).toISOString().slice(0, 16)}`;
+      if (!uniqueMap.has(key)) {
+        uniqueMap.set(key, { ...ev, ts: Date.parse(ev.date) });
+      }
+    }
+    
+    const all = Array.from(uniqueMap.values()).sort((a, b) => a.ts - b.ts);
     const events_total = all.length;
 
-    // ---- window and importance filtering ------------------------------------
-    const inWindow = all.filter(e => e.ts >= now && e.ts <= end);
+    // ---- Filtering ----------------------------------------------------------
+    const ALLOW_COUNTRIES = ['United States', 'Euro Area', 'United Kingdom', 'Japan', 'China', 'Germany'];
+    const MAJOR_KEYWORDS = ['CPI','NFP','FOMC','RATE','RATES','INTEREST','GDP','PMI','ECB','BOE','FED','NON-FARM','NONFARM','UNEMPLOYMENT','JOBLESS','RETAIL','SALES','INFLATION','PAYROLL','EMPLOYMENT'];
 
-    // Maintain configurable lists of allowed countries and high‑impact keywords
-    const ALLOW_COUNTRIES = ['United States', 'Euro Area', 'United Kingdom', 'Japan', 'China'];
-    const MAJOR_KEYWORDS = ['CPI','NFP','FOMC','RATE','RATES','INTEREST','GDP','PMI','ECB','BOE','FED','NON-FARM','NONFARM'];
-
-    const filtered = inWindow.filter(e => {
+    const filtered = all.filter(e => {
       if (!ALLOW_COUNTRIES.includes(e.country)) return false;
       if (mode === 'all') return true;
       const txt = String(e.event || '').toUpperCase();
       return MAJOR_KEYWORDS.some(k => txt.includes(k));
     }).slice(0, limit);
 
-    // ---- cache next events for /api/econ/upcoming ---------------------------
-    // Store only the limited list of upcoming events.  Use a TTL around
-    // 5 minutes (300s) so clients always see something but aren’t reliant on
-    // perfect cron timing.
+    // ---- Cache for /api/econ/upcoming ---------------------------------------
+    // Cache next 24h events (not just alert window) so /econ_upcoming shows more
+    const cacheEnd = now + 24 * 60 * 60 * 1000;
+    let cacheEvents = [];
+    if (source === 'provider') {
+      let provCache = await fetchFinnhub(now, cacheEnd);
+      if (!provCache || !provCache.length) provCache = await fetchFMP(now, cacheEnd);
+      cacheEvents = [...(provCache || []), ...(await fetchManual(now, cacheEnd))];
+    } else {
+      cacheEvents = await fetchManual(now, cacheEnd);
+    }
+    
+    const cacheMap = new Map();
+    for (const ev of cacheEvents) {
+      const key = `${ev.country}|${ev.event}|${new Date(ev.date).toISOString().slice(0, 16)}`;
+      if (!cacheMap.has(key)) {
+        cacheMap.set(key, { ...ev, ts: Date.parse(ev.date) });
+      }
+    }
+    const cacheFiltered = Array.from(cacheMap.values())
+      .filter(e => ALLOW_COUNTRIES.includes(e.country))
+      .sort((a, b) => a.ts - b.ts)
+      .slice(0, 20);
+
     await kv.set(
       'econ:cache:upcoming',
-      JSON.stringify({ at: Date.now(), items: filtered }),
+      JSON.stringify({ at: Date.now(), items: cacheFiltered }),
       { ex: 300 }
     );
 
-    // Early exit if nothing remains to send
     if (!filtered.length) {
       return res.json({
-        ok: true, source: 'manual', subs: validSubs.length,
+        ok: true, provider: providerUsed, subs: validSubs.length,
         events_total, events_after_filters: 0, sent: 0,
-        windowMin, mode, limit, dry, readMode
+        windowMin, mode, limit, dry
       });
     }
 
-    // ---- message formatting -------------------------------------------------
-    // Arabic translations for country names.  If a translation is missing
-    // fallback to the English name.  These translations cover the
-    // currently allowed set of countries.
+    // ---- Message Formatting -------------------------------------------------
     const countryAr = {
       'United States': 'الولايات المتحدة',
       'Euro Area': 'منطقة اليورو',
       'United Kingdom': 'المملكة المتحدة',
       'Japan': 'اليابان',
-      'China': 'الصين'
+      'China': 'الصين',
+      'Germany': 'ألمانيا'
     };
 
-    // Formatter for dates in Asia/Dubai time zone.  We attach the explicit
-    // time‑zone label manually because Intl.DateTimeFormat does not include
-    // it by default.  Should the region change, adjust here.
     const fmtEn = new Intl.DateTimeFormat('en-GB', {
       dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Dubai'
     });
 
-    /**
-     * Build a message for a single event based on the requested language.
-     * Supported values:
-     *   - 'ar': Arabic only
-     *   - 'both' or 'bi': bilingual (Arabic | English)
-     *   - default: English only
-     *
-     * Messages include a bell emoji, the country and event name, a time
-     * string and any available forecast/previous figures.  For bilingual
-     * messages Arabic precedes English separated by a vertical bar.
-     *
-     * @param {Object} ev Event with ts, country, event, forecast, previous
-     */
     function toMsg(ev) {
       const when = fmtEn.format(new Date(ev.ts)) + ' (Asia/Dubai)';
       const countryEn = ev.country;
@@ -164,14 +293,12 @@ module.exports = async function handler(req, res) {
       const forecast = ev.forecast;
       const previous = ev.previous;
 
-      // Arabic only
       if (langParam === 'ar') {
         let txt = `🔔 ${countryArName}: ${eventName}\n⏰ ${when}`;
         if (forecast) txt += `\nالتوقع: ${forecast}`;
         if (previous) txt += `\nالسابق: ${previous}`;
         return txt;
       }
-      // bilingual (both or bi)
       if (langParam === 'both' || langParam === 'bi') {
         const lines = [];
         lines.push(`🔔 ${countryArName}: ${eventName} | ${countryEn}: ${eventName}`);
@@ -180,35 +307,25 @@ module.exports = async function handler(req, res) {
         if (previous) lines.push(`السابق: ${previous} | Previous: ${previous}`);
         return lines.join('\n');
       }
-      // default English
       let txt = `🔔 ${countryEn}: ${eventName}\n⏰ ${when}`;
       if (forecast) txt += `\nForecast: ${forecast}`;
       if (previous) txt += `\nPrevious: ${previous}`;
       return txt;
     }
 
-    // ---- deduplication ------------------------------------------------------
-    // Use a per‑event key keyed on country, event and the ISO minute to
-    // prevent accidental duplicate sends across cron runs.  Keys expire
-    // automatically after 48 hours (48*3600 seconds).
+    // ---- Deduplication & Sending --------------------------------------------
     const DEDUPE_EXPIRY = 48 * 60 * 60;
-
     let sent = 0;
+
     if (!dry) {
       for (const ev of filtered) {
-        // Build dedupe key using the ISO minute (YYYY-MM-DDTHH:MM).  This
-        // coarse granularity groups together any occurrences within the same
-        // minute.
         const isoMinute = new Date(ev.ts).toISOString().slice(0, 16);
         const dedupeKey = `econ:sent:${ev.country}|${ev.event}|${isoMinute}`;
+        
         try {
           const already = await kv.get(dedupeKey);
-          if (already) {
-            continue;
-          }
-        } catch {
-          // ignore lookup errors, default to sending
-        }
+          if (already) continue;
+        } catch {}
 
         const text = toMsg(ev);
         for (const chatId of validSubs) {
@@ -219,19 +336,27 @@ module.exports = async function handler(req, res) {
           });
           sent++;
         }
+        
         try {
           await kv.set(dedupeKey, '1', { ex: DEDUPE_EXPIRY });
-        } catch {
-          // if dedupe write fails it is not fatal
-        }
+        } catch {}
       }
     }
 
-    // ---- result summary -----------------------------------------------------
+    // ---- Result Summary -----------------------------------------------------
     return res.json({
-      ok: true, source: 'manual', subs: validSubs.length,
-      events_total, events_after_filters: filtered.length, sent,
-      windowMin, mode, limit, dry, readMode
+      ok: true, 
+      provider: providerUsed,
+      subs: validSubs.length,
+      events_total, 
+      events_from_provider: providerEvents.length,
+      events_from_manual: manualEvents.length,
+      events_after_filters: filtered.length, 
+      sent,
+      windowMin, 
+      mode, 
+      limit, 
+      dry
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message, stack: e.stack });
