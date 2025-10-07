@@ -1,10 +1,24 @@
 // api/cron.js - Economic calendar alerts with Trading Economics API
 // Auto-triggers: Runs every 5 min, sends alerts 5-60 min before events
-// Real data from Trading Economics (primary) or Manual (fallback)
+// Rate limit aware: 1 req/sec for free tier
 
 'use strict';
 
 const { kv } = require('@vercel/kv');
+
+// Rate limiting: Trading Economics free tier = 1 req/sec
+let lastApiCall = 0;
+const MIN_API_INTERVAL = 1100; // 1.1 seconds between calls
+
+async function rateLimitedFetch(url, timeout = 12000) {
+  const now = Date.now();
+  const elapsed = now - lastApiCall;
+  if (elapsed < MIN_API_INTERVAL) {
+    await new Promise(r => setTimeout(r, MIN_API_INTERVAL - elapsed));
+  }
+  lastApiCall = Date.now();
+  return fetch(url, { signal: AbortSignal.timeout(timeout) });
+}
 
 // ============================================================================
 // PROVIDER ADAPTERS
@@ -12,8 +26,7 @@ const { kv } = require('@vercel/kv');
 
 /**
  * Fetch events from Trading Economics
- * Endpoint: /calendar
- * Docs: https://docs.tradingeconomics.com/economic_calendar/
+ * FREE TIER LIMITS: 1 req/sec, 500 calls/month
  */
 async function fetchTradingEconomics(fromMs, toMs) {
   const key = process.env.TRADING_ECONOMICS_API_KEY;
@@ -22,24 +35,21 @@ async function fetchTradingEconomics(fromMs, toMs) {
   const from = new Date(fromMs).toISOString().split('T')[0];
   const to = new Date(toMs).toISOString().split('T')[0];
   
-  // Trading Economics format: ?c={key}&d1={date}&d2={date}
   const url = `https://api.tradingeconomics.com/calendar?c=${key}&d1=${from}&d2=${to}&f=json`;
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    const res = await rateLimitedFetch(url);
     if (!res.ok) {
-      console.error('Trading Economics API error:', res.status, await res.text());
+      const errText = await res.text();
+      console.error('Trading Economics API error:', res.status, errText);
       return null;
     }
     const events = await res.json();
     
-    // Trading Economics returns: [{
-    //   CalendarId, Country, Event, Date, Actual, Previous, Forecast, TEForecast, Importance
-    // }]
     return events.map(e => ({
       country: normalizeCountry(e.Country),
       event: e.Event || 'Unknown Event',
-      date: e.Date, // Already ISO format
+      date: e.Date,
       forecast: e.Forecast || e.TEForecast || null,
       previous: e.Previous || null,
       impact: mapImportance(e.Importance)
@@ -50,19 +60,12 @@ async function fetchTradingEconomics(fromMs, toMs) {
   }
 }
 
-/**
- * Map Trading Economics Importance (1-3) to impact level
- * 1 = Low, 2 = Medium, 3 = High
- */
 function mapImportance(importance) {
   if (importance === 3) return 'high';
   if (importance === 2) return 'medium';
   return 'low';
 }
 
-/**
- * Normalize country names
- */
 function normalizeCountry(name) {
   const map = {
     'United States': 'United States',
@@ -74,17 +77,11 @@ function normalizeCountry(name) {
     'France': 'France',
     'Canada': 'Canada',
     'Australia': 'Australia',
-    'Switzerland': 'Switzerland',
-    'India': 'India',
-    'Brazil': 'Brazil'
+    'Switzerland': 'Switzerland'
   };
-  
   return map[name] || null;
 }
 
-/**
- * Fetch events from manual storage (admin-inserted test events)
- */
 async function fetchManual(fromMs, toMs) {
   try {
     let raw = await kv.zrange('econ:manual', 0, -1);
@@ -120,22 +117,18 @@ async function fetchManual(fromMs, toMs) {
 
 module.exports = async function handler(req, res) {
   try {
-    // ---- Authentication -----------------------------------------------------
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    // ---- Parameter Parsing --------------------------------------------------
     const q = new URL(req.url, 'http://x').searchParams;
     const dry = ['1', 'true'].includes((q.get('dry') || '').toLowerCase());
-    const mode = (q.get('mode') || 'major').toLowerCase(); // 'major' | 'all'
+    const mode = (q.get('mode') || 'major').toLowerCase();
     const minutes = q.get('minutes') ? Number(q.get('minutes')) : null;
     const days = q.get('days') ? Number(q.get('days')) : null;
     const limit = q.get('limit') ? Math.max(1, Number(q.get('limit'))) : 10;
-    const langParam = (q.get('lang') || 'both').toLowerCase();
     const source = (q.get('source') || 'provider').toLowerCase();
 
-    // Default: alert window 5-60 min
     const windowMin = minutes ?? (days ? days * 1440 : 60);
     const now = Date.now();
     const end = now + windowMin * 60 * 1000;
@@ -145,7 +138,6 @@ module.exports = async function handler(req, res) {
       return res.status(500).json({ ok: false, error: 'missing_bot_token' });
     }
 
-    // ---- Load Subscribers ---------------------------------------------------
     const subs = (await kv.smembers('econ:subs')) || [];
     const validSubs = subs.filter(x => /^\d+$/.test(String(x)));
     if (!validSubs.length) {
@@ -155,21 +147,50 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ---- Fetch Events -------------------------------------------------------
+    // ---- Fetch Events (rate limited) ----------------------------------------
     let providerEvents = [];
     let manualEvents = [];
     let providerUsed = 'none';
 
     if (source === 'provider') {
-      providerEvents = await fetchTradingEconomics(now, end);
-      if (providerEvents && providerEvents.length > 0) {
-        providerUsed = 'tradingeconomics';
-      } else {
-        providerEvents = [];
+      // Check cache first to avoid API calls
+      const cached = await kv.get('econ:api:cache');
+      if (cached) {
+        try {
+          const cacheData = JSON.parse(cached);
+          if (Date.now() - cacheData.at < 5 * 60 * 1000) {
+            providerEvents = cacheData.events.filter(e => {
+              const ts = Date.parse(e.date);
+              return ts >= now && ts <= end;
+            });
+            providerUsed = 'tradingeconomics_cached';
+          }
+        } catch {}
+      }
+
+      // If no cache or expired, fetch new data
+      if (!providerEvents.length) {
+        // Fetch wider window to cache
+        const fetchEnd = now + 24 * 60 * 60 * 1000; // 24h
+        providerEvents = await fetchTradingEconomics(now, fetchEnd);
+        if (providerEvents && providerEvents.length > 0) {
+          providerUsed = 'tradingeconomics';
+          // Cache for 5 min
+          await kv.set('econ:api:cache', JSON.stringify({
+            at: Date.now(),
+            events: providerEvents
+          }), { ex: 300 });
+          // Filter to alert window
+          providerEvents = providerEvents.filter(e => {
+            const ts = Date.parse(e.date);
+            return ts >= now && ts <= end;
+          });
+        } else {
+          providerEvents = [];
+        }
       }
     }
 
-    // Always merge manual events
     manualEvents = await fetchManual(now, end);
 
     // Combine and deduplicate
@@ -199,9 +220,16 @@ module.exports = async function handler(req, res) {
     // ---- Cache for /api/econ/upcoming ---------------------------------------
     const cacheEnd = now + 24 * 60 * 60 * 1000;
     let cacheEvents = [];
+    
     if (source === 'provider') {
-      let provCache = await fetchTradingEconomics(now, cacheEnd);
-      cacheEvents = [...(provCache || []), ...(await fetchManual(now, cacheEnd))];
+      // Use same cache to avoid extra API call
+      const cached = await kv.get('econ:api:cache');
+      if (cached) {
+        try {
+          const cacheData = JSON.parse(cached);
+          cacheEvents = [...cacheData.events, ...(await fetchManual(now, cacheEnd))];
+        } catch {}
+      }
     } else {
       cacheEvents = await fetchManual(now, cacheEnd);
     }
@@ -249,18 +277,11 @@ module.exports = async function handler(req, res) {
     function toMsg(ev) {
       const when = fmtEn.format(new Date(ev.ts));
       const flag = countryFlags[ev.country] || '🌐';
-      const countryEn = ev.country;
-      const eventName = ev.event;
-      const forecast = ev.forecast;
-      const previous = ev.previous;
-
-      // Match your screenshot format
       const lines = [];
-      lines.push(`${flag} ${countryEn}: ${eventName}`);
+      lines.push(`${flag} ${ev.country}: ${ev.event}`);
       lines.push(`⏰ ${when} (Asia/Dubai)`);
-      if (forecast) lines.push(`Forecast: ${forecast}`);
-      if (previous) lines.push(`Previous: ${previous}`);
-      
+      if (ev.forecast) lines.push(`Forecast: ${ev.forecast}`);
+      if (ev.previous) lines.push(`Previous: ${ev.previous}`);
       return lines.join('\n');
     }
 
@@ -294,7 +315,6 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // ---- Result Summary -----------------------------------------------------
     return res.json({
       ok: true, 
       provider: providerUsed,
