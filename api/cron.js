@@ -13,7 +13,7 @@ const { kv } = require('@vercel/kv');
 /**
  * Fetch events from Trading Economics
  * Endpoint: /calendar
- * Docs: https://docs.tradingeconomics.com/#economic-calendar
+ * Docs: https://docs.tradingeconomics.com/economic_calendar/
  */
 async function fetchTradingEconomics(fromMs, toMs) {
   const key = process.env.TRADING_ECONOMICS_API_KEY;
@@ -22,16 +22,19 @@ async function fetchTradingEconomics(fromMs, toMs) {
   const from = new Date(fromMs).toISOString().split('T')[0];
   const to = new Date(toMs).toISOString().split('T')[0];
   
-  // Trading Economics format: client_key:secret_key
+  // Trading Economics format: ?c={key}&d1={date}&d2={date}
   const url = `https://api.tradingeconomics.com/calendar?c=${key}&d1=${from}&d2=${to}&f=json`;
 
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error('Trading Economics API error:', res.status, await res.text());
+      return null;
+    }
     const events = await res.json();
     
     // Trading Economics returns: [{
-    //   Country, Event, Date (ISO), Forecast, Previous, TEForecast, Actual, Importance
+    //   CalendarId, Country, Event, Date, Actual, Previous, Forecast, TEForecast, Importance
     // }]
     return events.map(e => ({
       country: normalizeCountry(e.Country),
@@ -237,15 +240,6 @@ module.exports = async function handler(req, res) {
       'Japan': '🇯🇵',
       'China': '🇨🇳',
       'Germany': '🇩🇪'
-    };
-    
-    const countryAr = {
-      'United States': 'الولايات المتحدة',
-      'Euro Area': 'منطقة اليورو',
-      'United Kingdom': 'المملكة المتحدة',
-      'Japan': 'اليابان',
-      'China': 'الصين',
-      'Germany': 'ألمانيا'
     };
 
     const fmtEn = new Intl.DateTimeFormat('en-GB', {
