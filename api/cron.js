@@ -60,19 +60,23 @@ async function fetchTradingEconomics(fromMs, toMs) {
     const countriesFound = [...new Set(events.map(e => e.Country))];
     console.log('[API] Countries in response:', countriesFound.join(', '));
     
+    // FIX: Map actual field names from API response
     const normalized = events.map(e => ({
       country: normalizeCountry(e.Country),
       event: e.Event || 'Unknown Event',
       date: e.Date,
+      actual: e.Actual || null,           // FIXED: Capital A
       forecast: e.Forecast || e.TEForecast || null,
-      previous: e.Previous || null,
+      previous: e.Previous || null,       // FIXED: Capital P
       impact: mapImportance(e.Importance),
       rawCountry: e.Country // Keep for debugging
     })).filter(e => e.country);
     
     console.log(`[API] After country filter: ${normalized.length} events from major countries`);
     if (normalized.length > 0) {
-      console.log('[API] Sample events:', normalized.slice(0, 5).map(e => `${e.country}: ${e.event} @ ${e.date}`));
+      console.log('[API] Sample events:', normalized.slice(0, 3).map(e => 
+        `${e.country}: ${e.event} @ ${e.date} [F:${e.forecast} P:${e.previous}]`
+      ));
     }
     return normalized;
   } catch (err) {
@@ -88,7 +92,7 @@ function mapImportance(importance) {
 }
 
 function normalizeCountry(name) {
-  // TOP 5 MAJOR ECONOMIES ONLY (by GDP)
+  // TOP 6 MAJOR ECONOMIES ONLY (by GDP)
   const map = {
     'United States': 'United States',
     'China': 'China',
@@ -267,7 +271,7 @@ module.exports = async function handler(req, res) {
     console.log(`[EVENTS] Total unique: ${events_total}`);
 
     // ---- Filtering ----------------------------------------------------------
-    // Only allow top 5 major economies
+    // Only allow top 6 major economies
     const ALLOW_COUNTRIES = [
       'United States',
       'China', 
@@ -287,10 +291,12 @@ module.exports = async function handler(req, res) {
 
     console.log(`[FILTER] After filters: ${filtered.length} events (mode: ${mode}, limit: ${limit})`);
     if (filtered.length > 0) {
-      console.log('[FILTER] Filtered events:', filtered.map(e => `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString()}`));
+      console.log('[FILTER] Sample:', filtered.slice(0, 3).map(e => 
+        `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString().slice(0,16)}`
+      ));
     }
 
-    // ---- Cache for /api/econ/upcoming ---------------------------------------
+    // ---- Cache for /api/econ/upcoming (FIX: Do this BEFORE response) -------
     const cacheEnd = now + 7 * 24 * 60 * 60 * 1000; // 7 days
     let cacheEvents = [];
     
@@ -314,15 +320,29 @@ module.exports = async function handler(req, res) {
       }
     }
     const cacheFiltered = Array.from(cacheMap.values())
-      .filter(e => ALLOW_COUNTRIES.includes(e.country))
+      .filter(e => e.ts >= now && ALLOW_COUNTRIES.includes(e.country)) // FIX: Only future events
       .sort((a, b) => a.ts - b.ts)
       .slice(0, 50);
 
+    // FIX: Set cache with properly formatted items
     await kv.set(
       'econ:cache:upcoming',
-      JSON.stringify({ at: Date.now(), items: cacheFiltered }),
+      JSON.stringify({ 
+        at: Date.now(), 
+        items: cacheFiltered.map(e => ({
+          country: e.country,
+          event: e.event,
+          date: new Date(e.ts).toISOString(),
+          forecast: e.forecast,
+          previous: e.previous,
+          actual: e.actual,
+          impact: e.impact
+        }))
+      }),
       { ex: 3600 } // Cache for 1 hour
     );
+    
+    console.log(`[CACHE] Updated econ:cache:upcoming with ${cacheFiltered.length} events`);
 
     if (!filtered.length) {
       console.log('[SKIP] No events after filtering');
@@ -351,10 +371,12 @@ module.exports = async function handler(req, res) {
       const when = fmtEn.format(new Date(ev.ts));
       const flag = countryFlags[ev.country] || '🌐';
       const lines = [];
-      lines.push(`${flag} ${ev.country}: ${ev.event}`);
-      lines.push(`⏰ ${when} (Asia/Dubai)`);
-      if (ev.forecast) lines.push(`Forecast: ${ev.forecast}`);
-      if (ev.previous) lines.push(`Previous: ${ev.previous}`);
+      lines.push(`🔔 *Economic Alert*`);
+      lines.push(`${flag} *${ev.country}*`);
+      lines.push(`📊 ${ev.event}`);
+      lines.push(`⏰ ${when} Dubai time`);
+      if (ev.forecast) lines.push(`📈 Forecast: ${ev.forecast}`);
+      if (ev.previous) lines.push(`📉 Previous: ${ev.previous}`);
       return lines.join('\n');
     }
 
@@ -378,14 +400,18 @@ module.exports = async function handler(req, res) {
         } catch {}
 
         const text = toMsg(ev);
-        console.log(`[MSG] Sending to ${validSubs.length} users:`, text.split('\n')[0]);
+        console.log(`[MSG] Sending to ${validSubs.length} users:`, text.split('\n')[1]);
         
         for (const chatId of validSubs) {
           try {
             const sendRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ chat_id: chatId, text })
+              body: JSON.stringify({ 
+                chat_id: chatId, 
+                text,
+                parse_mode: 'Markdown' 
+              })
             });
             
             if (!sendRes.ok) {
@@ -408,7 +434,9 @@ module.exports = async function handler(req, res) {
         }
       }
     } else {
-      console.log('[DRY] Would send:', filtered.map(e => `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString()}`));
+      console.log('[DRY] Would send:', filtered.map(e => 
+        `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString().slice(0,16)}`
+      ));
     }
 
     const duration = Date.now() - startTime;
