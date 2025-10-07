@@ -1,22 +1,25 @@
 // api/cron.js - Economic calendar alerts with Trading Economics API
-// Auto-triggers: Runs every 5 min, sends alerts 5-60 min before events
-// Rate limit aware: 1 req/sec for free tier
+// Auto-triggers: Runs every 15 min, sends alerts 5-60 min before events
+// Rate limit aware: 1 req/3sec for free tier (500 calls/month)
 
 'use strict';
 
 const { kv } = require('@vercel/kv');
 
-// Rate limiting: Trading Economics free tier = 1 req/sec
+// Rate limiting: Trading Economics free tier = 500 calls/month
+// Space out calls: 1 call per 3 seconds to avoid 429 errors
 let lastApiCall = 0;
-const MIN_API_INTERVAL = 1100; // 1.1 seconds between calls
+const MIN_API_INTERVAL = 3000; // 3 seconds between calls
 
-async function rateLimitedFetch(url, timeout = 12000) {
+async function rateLimitedFetch(url, timeout = 15000) {
   const now = Date.now();
   const elapsed = now - lastApiCall;
   if (elapsed < MIN_API_INTERVAL) {
     await new Promise(r => setTimeout(r, MIN_API_INTERVAL - elapsed));
   }
   lastApiCall = Date.now();
+  
+  console.log('[FETCH] Calling:', url.replace(/c=[^&]+/, 'c=***'));
   return fetch(url, { signal: AbortSignal.timeout(timeout) });
 }
 
@@ -26,11 +29,14 @@ async function rateLimitedFetch(url, timeout = 12000) {
 
 /**
  * Fetch events from Trading Economics
- * FREE TIER LIMITS: 1 req/sec, 500 calls/month
+ * FREE TIER LIMITS: 500 calls/month, rate limit unknown (using 3s spacing)
  */
 async function fetchTradingEconomics(fromMs, toMs) {
   const key = process.env.TRADING_ECONOMICS_API_KEY;
-  if (!key) return null;
+  if (!key) {
+    console.log('[WARN] No TRADING_ECONOMICS_API_KEY found');
+    return null;
+  }
 
   const from = new Date(fromMs).toISOString().split('T')[0];
   const to = new Date(toMs).toISOString().split('T')[0];
@@ -39,14 +45,18 @@ async function fetchTradingEconomics(fromMs, toMs) {
 
   try {
     const res = await rateLimitedFetch(url);
+    console.log('[API] Trading Economics response:', res.status);
+    
     if (!res.ok) {
       const errText = await res.text();
-      console.error('Trading Economics API error:', res.status, errText);
+      console.error('[ERROR] Trading Economics API:', res.status, errText);
       return null;
     }
-    const events = await res.json();
     
-    return events.map(e => ({
+    const events = await res.json();
+    console.log(`[API] Fetched ${events.length} events from Trading Economics`);
+    
+    const normalized = events.map(e => ({
       country: normalizeCountry(e.Country),
       event: e.Event || 'Unknown Event',
       date: e.Date,
@@ -54,8 +64,11 @@ async function fetchTradingEconomics(fromMs, toMs) {
       previous: e.Previous || null,
       impact: mapImportance(e.Importance)
     })).filter(e => e.country);
+    
+    console.log(`[API] Normalized to ${normalized.length} events (filtered by country)`);
+    return normalized;
   } catch (err) {
-    console.error('Trading Economics fetch failed:', err.message);
+    console.error('[ERROR] Trading Economics fetch failed:', err.message);
     return null;
   }
 }
@@ -94,7 +107,7 @@ async function fetchManual(fromMs, toMs) {
       } catch {}
     }
 
-    return (raw || [])
+    const parsed = (raw || [])
       .map(s => {
         try {
           const o = typeof s === 'string' ? JSON.parse(s) : s;
@@ -106,7 +119,11 @@ async function fetchManual(fromMs, toMs) {
       })
       .filter(Boolean)
       .filter(e => e.ts >= fromMs && e.ts <= toMs);
-  } catch {
+    
+    console.log(`[MANUAL] Fetched ${parsed.length} manual events`);
+    return parsed;
+  } catch (err) {
+    console.error('[ERROR] Manual fetch failed:', err.message);
     return [];
   }
 }
@@ -116,11 +133,23 @@ async function fetchManual(fromMs, toMs) {
 // ============================================================================
 
 module.exports = async function handler(req, res) {
+  const startTime = Date.now();
+  console.log('\n[CRON START]', new Date().toISOString());
+  
   try {
-    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+    // Auth check
+    const authHeader = req.headers.authorization;
+    const expectedAuth = `Bearer ${process.env.CRON_SECRET}`;
+    
+    console.log('[AUTH] Header present:', !!authHeader);
+    console.log('[AUTH] Secret configured:', !!process.env.CRON_SECRET);
+    
+    if (authHeader !== expectedAuth) {
+      console.error('[AUTH FAIL] Invalid or missing authorization');
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
+    // Parse query params
     const q = new URL(req.url, 'http://x').searchParams;
     const dry = ['1', 'true'].includes((q.get('dry') || '').toLowerCase());
     const mode = (q.get('mode') || 'major').toLowerCase();
@@ -133,14 +162,22 @@ module.exports = async function handler(req, res) {
     const now = Date.now();
     const end = now + windowMin * 60 * 1000;
 
+    console.log('[PARAMS]', { dry, mode, windowMin, limit, source });
+
+    // Check bot token
     const BOT_TOKEN = process.env.LIIRAT_BOT_TOKEN || process.env.TG_BOT_TOKEN;
     if (!BOT_TOKEN) {
+      console.error('[ERROR] No bot token configured');
       return res.status(500).json({ ok: false, error: 'missing_bot_token' });
     }
 
+    // Get subscribers
     const subs = (await kv.smembers('econ:subs')) || [];
     const validSubs = subs.filter(x => /^\d+$/.test(String(x)));
+    console.log('[SUBS]', { total: subs.length, valid: validSubs.length, ids: validSubs });
+    
     if (!validSubs.length) {
+      console.log('[SKIP] No valid subscribers');
       return res.json({
         ok: true, source: 'none', subs: 0, events_total: 0,
         events_after_filters: 0, sent: 0, windowMin, mode, limit, dry
@@ -153,39 +190,55 @@ module.exports = async function handler(req, res) {
     let providerUsed = 'none';
 
     if (source === 'provider') {
-      // Check cache first to avoid API calls
-      const cached = await kv.get('econ:api:cache');
+      // Check cache first (5 min TTL)
+      const cacheKey = 'econ:api:cache';
+      const cached = await kv.get(cacheKey);
+      
       if (cached) {
         try {
-          const cacheData = JSON.parse(cached);
-          if (Date.now() - cacheData.at < 5 * 60 * 1000) {
+          const cacheData = typeof cached === 'string' ? JSON.parse(cached) : cached;
+          const cacheAge = Date.now() - cacheData.at;
+          console.log(`[CACHE] Found cache, age: ${Math.round(cacheAge / 1000)}s`);
+          
+          if (cacheAge < 5 * 60 * 1000) {
             providerEvents = cacheData.events.filter(e => {
               const ts = Date.parse(e.date);
               return ts >= now && ts <= end;
             });
             providerUsed = 'tradingeconomics_cached';
+            console.log(`[CACHE] Using cached data: ${providerEvents.length} events in window`);
+          } else {
+            console.log('[CACHE] Expired, fetching fresh data');
           }
-        } catch {}
+        } catch (err) {
+          console.error('[CACHE ERROR]', err.message);
+        }
       }
 
       // If no cache or expired, fetch new data
       if (!providerEvents.length) {
-        // Fetch wider window to cache
-        const fetchEnd = now + 24 * 60 * 60 * 1000; // 24h
-        providerEvents = await fetchTradingEconomics(now, fetchEnd);
-        if (providerEvents && providerEvents.length > 0) {
+        console.log('[API] Fetching fresh data (24h window for cache)');
+        const fetchEnd = now + 24 * 60 * 60 * 1000; // 24h for caching
+        const freshData = await fetchTradingEconomics(now, fetchEnd);
+        
+        if (freshData && freshData.length > 0) {
           providerUsed = 'tradingeconomics';
+          console.log(`[API] Got ${freshData.length} events, caching for 5 min`);
+          
           // Cache for 5 min
-          await kv.set('econ:api:cache', JSON.stringify({
+          await kv.set(cacheKey, JSON.stringify({
             at: Date.now(),
-            events: providerEvents
+            events: freshData
           }), { ex: 300 });
+          
           // Filter to alert window
-          providerEvents = providerEvents.filter(e => {
+          providerEvents = freshData.filter(e => {
             const ts = Date.parse(e.date);
             return ts >= now && ts <= end;
           });
+          console.log(`[API] ${providerEvents.length} events in alert window`);
         } else {
+          console.log('[API] No events returned or fetch failed');
           providerEvents = [];
         }
       }
@@ -205,6 +258,7 @@ module.exports = async function handler(req, res) {
     
     const all = Array.from(uniqueMap.values()).sort((a, b) => a.ts - b.ts);
     const events_total = all.length;
+    console.log(`[EVENTS] Total unique: ${events_total}`);
 
     // ---- Filtering ----------------------------------------------------------
     const ALLOW_COUNTRIES = ['United States', 'Euro Area', 'United Kingdom', 'Japan', 'China', 'Germany'];
@@ -217,16 +271,17 @@ module.exports = async function handler(req, res) {
       return MAJOR_KEYWORDS.some(k => txt.includes(k));
     }).slice(0, limit);
 
+    console.log(`[FILTER] After filters: ${filtered.length} events (mode: ${mode}, limit: ${limit})`);
+
     // ---- Cache for /api/econ/upcoming ---------------------------------------
     const cacheEnd = now + 24 * 60 * 60 * 1000;
     let cacheEvents = [];
     
     if (source === 'provider') {
-      // Use same cache to avoid extra API call
       const cached = await kv.get('econ:api:cache');
       if (cached) {
         try {
-          const cacheData = JSON.parse(cached);
+          const cacheData = typeof cached === 'string' ? JSON.parse(cached) : cached;
           cacheEvents = [...cacheData.events, ...(await fetchManual(now, cacheEnd))];
         } catch {}
       }
@@ -253,6 +308,7 @@ module.exports = async function handler(req, res) {
     );
 
     if (!filtered.length) {
+      console.log('[SKIP] No events after filtering');
       return res.json({
         ok: true, provider: providerUsed, subs: validSubs.length,
         events_total, events_after_filters: 0, sent: 0,
@@ -289,6 +345,8 @@ module.exports = async function handler(req, res) {
     const DEDUPE_EXPIRY = 48 * 60 * 60;
     let sent = 0;
 
+    console.log(`[SEND] ${dry ? 'DRY RUN' : 'LIVE'} - Processing ${filtered.length} events for ${validSubs.length} subs`);
+
     if (!dry) {
       for (const ev of filtered) {
         const isoMinute = new Date(ev.ts).toISOString().slice(0, 16);
@@ -296,24 +354,48 @@ module.exports = async function handler(req, res) {
         
         try {
           const already = await kv.get(dedupeKey);
-          if (already) continue;
+          if (already) {
+            console.log(`[SKIP] Already sent: ${dedupeKey}`);
+            continue;
+          }
         } catch {}
 
         const text = toMsg(ev);
+        console.log(`[MSG] Sending to ${validSubs.length} users:`, text.split('\n')[0]);
+        
         for (const chatId of validSubs) {
-          await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text })
-          });
-          sent++;
+          try {
+            const sendRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, text })
+            });
+            
+            if (!sendRes.ok) {
+              const errData = await sendRes.json();
+              console.error(`[TG ERROR] Chat ${chatId}:`, errData);
+            } else {
+              console.log(`[TG OK] Sent to ${chatId}`);
+              sent++;
+            }
+          } catch (err) {
+            console.error(`[TG ERROR] Chat ${chatId}:`, err.message);
+          }
         }
         
         try {
           await kv.set(dedupeKey, '1', { ex: DEDUPE_EXPIRY });
-        } catch {}
+          console.log(`[DEDUPE] Marked sent: ${dedupeKey}`);
+        } catch (err) {
+          console.error(`[DEDUPE ERROR]`, err.message);
+        }
       }
+    } else {
+      console.log('[DRY] Would send:', filtered.map(e => `${e.country}: ${e.event}`));
     }
+
+    const duration = Date.now() - startTime;
+    console.log(`[CRON END] Duration: ${duration}ms, Sent: ${sent} alerts`);
 
     return res.json({
       ok: true, 
@@ -327,9 +409,15 @@ module.exports = async function handler(req, res) {
       windowMin, 
       mode, 
       limit, 
-      dry
+      dry,
+      duration_ms: duration
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message, stack: e.stack });
+    console.error('[FATAL]', e);
+    return res.status(500).json({ 
+      ok: false, 
+      error: e.message, 
+      stack: process.env.NODE_ENV === 'development' ? e.stack : undefined 
+    });
   }
 };
