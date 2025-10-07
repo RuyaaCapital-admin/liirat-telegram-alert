@@ -54,7 +54,11 @@ async function fetchTradingEconomics(fromMs, toMs) {
     }
     
     const events = await res.json();
-    console.log(`[API] Fetched ${events.length} events from Trading Economics`);
+    console.log(`[API] Fetched ${events.length} raw events from Trading Economics`);
+    
+    // Log all countries found for debugging
+    const countriesFound = [...new Set(events.map(e => e.Country))];
+    console.log('[API] Countries in response:', countriesFound.join(', '));
     
     const normalized = events.map(e => ({
       country: normalizeCountry(e.Country),
@@ -66,9 +70,9 @@ async function fetchTradingEconomics(fromMs, toMs) {
       rawCountry: e.Country // Keep for debugging
     })).filter(e => e.country);
     
-    console.log(`[API] Normalized to ${normalized.length} events (filtered by country)`);
+    console.log(`[API] After country filter: ${normalized.length} events from major countries`);
     if (normalized.length > 0) {
-      console.log('[API] Sample events:', normalized.slice(0, 3).map(e => `${e.country}: ${e.event}`));
+      console.log('[API] Sample events:', normalized.slice(0, 5).map(e => `${e.country}: ${e.event} @ ${e.date}`));
     }
     return normalized;
   } catch (err) {
@@ -84,32 +88,14 @@ function mapImportance(importance) {
 }
 
 function normalizeCountry(name) {
+  // TOP 5 MAJOR ECONOMIES ONLY (by GDP)
   const map = {
     'United States': 'United States',
-    'Euro Area': 'Euro Area',
-    'United Kingdom': 'United Kingdom',
-    'Japan': 'Japan',
     'China': 'China',
+    'Japan': 'Japan',
     'Germany': 'Germany',
-    'France': 'France',
-    'Canada': 'Canada',
-    'Australia': 'Australia',
-    'Switzerland': 'Switzerland',
-    'New Zealand': 'New Zealand',
-    'South Korea': 'South Korea',
-    'Italy': 'Italy',
-    'Spain': 'Spain',
-    'Netherlands': 'Netherlands',
-    'Sweden': 'Sweden',
-    'Norway': 'Norway',
-    'Singapore': 'Singapore',
-    'Hong Kong': 'Hong Kong',
-    'India': 'India',
-    'Brazil': 'Brazil',
-    'Mexico': 'Mexico',
-    'Russia': 'Russia',
-    'South Africa': 'South Africa',
-    'Turkey': 'Turkey'
+    'United Kingdom': 'United Kingdom',
+    'Euro Area': 'Euro Area'
   };
   return map[name] || null;
 }
@@ -209,7 +195,7 @@ module.exports = async function handler(req, res) {
     let providerUsed = 'none';
 
     if (source === 'provider') {
-      // Check cache first (5 min TTL)
+      // Check cache first (cache until events are past)
       const cacheKey = 'econ:api:cache';
       const cached = await kv.get(cacheKey);
       
@@ -219,7 +205,8 @@ module.exports = async function handler(req, res) {
           const cacheAge = Date.now() - cacheData.at;
           console.log(`[CACHE] Found cache, age: ${Math.round(cacheAge / 1000)}s`);
           
-          if (cacheAge < 5 * 60 * 1000) {
+          // Use cache for 1 hour (avoid too many API calls)
+          if (cacheAge < 60 * 60 * 1000) {
             providerEvents = cacheData.events.filter(e => {
               const ts = Date.parse(e.date);
               return ts >= now && ts <= end;
@@ -227,7 +214,7 @@ module.exports = async function handler(req, res) {
             providerUsed = 'tradingeconomics_cached';
             console.log(`[CACHE] Using cached data: ${providerEvents.length} events in window`);
           } else {
-            console.log('[CACHE] Expired, fetching fresh data');
+            console.log('[CACHE] Expired (>1h), fetching fresh data');
           }
         } catch (err) {
           console.error('[CACHE ERROR]', err.message);
@@ -235,20 +222,20 @@ module.exports = async function handler(req, res) {
       }
 
       // If no cache or expired, fetch new data
-      if (!providerEvents.length) {
-        console.log('[API] Fetching fresh data (24h window for cache)');
-        const fetchEnd = now + 24 * 60 * 60 * 1000; // 24h for caching
+      if (!providerEvents.length || providerUsed === 'none') {
+        console.log('[API] Fetching fresh data (7 day window for cache)');
+        const fetchEnd = now + 7 * 24 * 60 * 60 * 1000; // 7 days for caching
         const freshData = await fetchTradingEconomics(now, fetchEnd);
         
         if (freshData && freshData.length > 0) {
           providerUsed = 'tradingeconomics';
-          console.log(`[API] Got ${freshData.length} events, caching for 5 min`);
+          console.log(`[API] Got ${freshData.length} events, caching for 1 hour`);
           
-          // Cache for 5 min
+          // Cache for 1 hour (3600 seconds)
           await kv.set(cacheKey, JSON.stringify({
             at: Date.now(),
             events: freshData
-          }), { ex: 300 });
+          }), { ex: 3600 });
           
           // Filter to alert window
           providerEvents = freshData.filter(e => {
@@ -280,11 +267,14 @@ module.exports = async function handler(req, res) {
     console.log(`[EVENTS] Total unique: ${events_total}`);
 
     // ---- Filtering ----------------------------------------------------------
+    // Only allow top 5 major economies
     const ALLOW_COUNTRIES = [
-      'United States', 'Euro Area', 'United Kingdom', 'Japan', 'China', 'Germany',
-      'France', 'Canada', 'Australia', 'Switzerland', 'New Zealand', 'South Korea',
-      'Italy', 'Spain', 'Netherlands', 'Sweden', 'Norway', 'Singapore', 'Hong Kong',
-      'India', 'Brazil', 'Mexico', 'Russia', 'South Africa', 'Turkey'
+      'United States',
+      'China', 
+      'Japan',
+      'Germany',
+      'United Kingdom',
+      'Euro Area'
     ];
     const MAJOR_KEYWORDS = ['CPI','NFP','FOMC','RATE','RATES','INTEREST','GDP','PMI','ECB','BOE','FED','NON-FARM','NONFARM','UNEMPLOYMENT','JOBLESS','RETAIL','SALES','INFLATION','PAYROLL','EMPLOYMENT'];
 
@@ -297,11 +287,11 @@ module.exports = async function handler(req, res) {
 
     console.log(`[FILTER] After filters: ${filtered.length} events (mode: ${mode}, limit: ${limit})`);
     if (filtered.length > 0) {
-      console.log('[FILTER] Sample filtered:', filtered.slice(0, 3).map(e => `${e.country}: ${e.event}`));
+      console.log('[FILTER] Filtered events:', filtered.map(e => `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString()}`));
     }
 
     // ---- Cache for /api/econ/upcoming ---------------------------------------
-    const cacheEnd = now + 24 * 60 * 60 * 1000;
+    const cacheEnd = now + 7 * 24 * 60 * 60 * 1000; // 7 days
     let cacheEvents = [];
     
     if (source === 'provider') {
@@ -326,12 +316,12 @@ module.exports = async function handler(req, res) {
     const cacheFiltered = Array.from(cacheMap.values())
       .filter(e => ALLOW_COUNTRIES.includes(e.country))
       .sort((a, b) => a.ts - b.ts)
-      .slice(0, 20);
+      .slice(0, 50);
 
     await kv.set(
       'econ:cache:upcoming',
       JSON.stringify({ at: Date.now(), items: cacheFiltered }),
-      { ex: 300 }
+      { ex: 3600 } // Cache for 1 hour
     );
 
     if (!filtered.length) {
@@ -350,26 +340,7 @@ module.exports = async function handler(req, res) {
       'United Kingdom': '🇬🇧',
       'Japan': '🇯🇵',
       'China': '🇨🇳',
-      'Germany': '🇩🇪',
-      'France': '🇫🇷',
-      'Canada': '🇨🇦',
-      'Australia': '🇦🇺',
-      'Switzerland': '🇨🇭',
-      'New Zealand': '🇳🇿',
-      'South Korea': '🇰🇷',
-      'Italy': '🇮🇹',
-      'Spain': '🇪🇸',
-      'Netherlands': '🇳🇱',
-      'Sweden': '🇸🇪',
-      'Norway': '🇳🇴',
-      'Singapore': '🇸🇬',
-      'Hong Kong': '🇭🇰',
-      'India': '🇮🇳',
-      'Brazil': '🇧🇷',
-      'Mexico': '🇲🇽',
-      'Russia': '🇷🇺',
-      'South Africa': '🇿🇦',
-      'Turkey': '🇹🇷'
+      'Germany': '🇩🇪'
     };
 
     const fmtEn = new Intl.DateTimeFormat('en-GB', {
@@ -437,7 +408,7 @@ module.exports = async function handler(req, res) {
         }
       }
     } else {
-      console.log('[DRY] Would send:', filtered.map(e => `${e.country}: ${e.event}`));
+      console.log('[DRY] Would send:', filtered.map(e => `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString()}`));
     }
 
     const duration = Date.now() - startTime;
