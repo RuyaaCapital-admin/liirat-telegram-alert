@@ -62,10 +62,14 @@ async function fetchTradingEconomics(fromMs, toMs) {
       date: e.Date,
       forecast: e.Forecast || e.TEForecast || null,
       previous: e.Previous || null,
-      impact: mapImportance(e.Importance)
+      impact: mapImportance(e.Importance),
+      rawCountry: e.Country // Keep for debugging
     })).filter(e => e.country);
     
     console.log(`[API] Normalized to ${normalized.length} events (filtered by country)`);
+    if (normalized.length > 0) {
+      console.log('[API] Sample events:', normalized.slice(0, 3).map(e => `${e.country}: ${e.event}`));
+    }
     return normalized;
   } catch (err) {
     console.error('[ERROR] Trading Economics fetch failed:', err.message);
@@ -90,7 +94,22 @@ function normalizeCountry(name) {
     'France': 'France',
     'Canada': 'Canada',
     'Australia': 'Australia',
-    'Switzerland': 'Switzerland'
+    'Switzerland': 'Switzerland',
+    'New Zealand': 'New Zealand',
+    'South Korea': 'South Korea',
+    'Italy': 'Italy',
+    'Spain': 'Spain',
+    'Netherlands': 'Netherlands',
+    'Sweden': 'Sweden',
+    'Norway': 'Norway',
+    'Singapore': 'Singapore',
+    'Hong Kong': 'Hong Kong',
+    'India': 'India',
+    'Brazil': 'Brazil',
+    'Mexico': 'Mexico',
+    'Russia': 'Russia',
+    'South Africa': 'South Africa',
+    'Turkey': 'Turkey'
   };
   return map[name] || null;
 }
@@ -261,7 +280,12 @@ module.exports = async function handler(req, res) {
     console.log(`[EVENTS] Total unique: ${events_total}`);
 
     // ---- Filtering ----------------------------------------------------------
-    const ALLOW_COUNTRIES = ['United States', 'Euro Area', 'United Kingdom', 'Japan', 'China', 'Germany'];
+    const ALLOW_COUNTRIES = [
+      'United States', 'Euro Area', 'United Kingdom', 'Japan', 'China', 'Germany',
+      'France', 'Canada', 'Australia', 'Switzerland', 'New Zealand', 'South Korea',
+      'Italy', 'Spain', 'Netherlands', 'Sweden', 'Norway', 'Singapore', 'Hong Kong',
+      'India', 'Brazil', 'Mexico', 'Russia', 'South Africa', 'Turkey'
+    ];
     const MAJOR_KEYWORDS = ['CPI','NFP','FOMC','RATE','RATES','INTEREST','GDP','PMI','ECB','BOE','FED','NON-FARM','NONFARM','UNEMPLOYMENT','JOBLESS','RETAIL','SALES','INFLATION','PAYROLL','EMPLOYMENT'];
 
     const filtered = all.filter(e => {
@@ -272,6 +296,9 @@ module.exports = async function handler(req, res) {
     }).slice(0, limit);
 
     console.log(`[FILTER] After filters: ${filtered.length} events (mode: ${mode}, limit: ${limit})`);
+    if (filtered.length > 0) {
+      console.log('[FILTER] Sample filtered:', filtered.slice(0, 3).map(e => `${e.country}: ${e.event}`));
+    }
 
     // ---- Cache for /api/econ/upcoming ---------------------------------------
     const cacheEnd = now + 24 * 60 * 60 * 1000;
@@ -323,7 +350,26 @@ module.exports = async function handler(req, res) {
       'United Kingdom': '🇬🇧',
       'Japan': '🇯🇵',
       'China': '🇨🇳',
-      'Germany': '🇩🇪'
+      'Germany': '🇩🇪',
+      'France': '🇫🇷',
+      'Canada': '🇨🇦',
+      'Australia': '🇦🇺',
+      'Switzerland': '🇨🇭',
+      'New Zealand': '🇳🇿',
+      'South Korea': '🇰🇷',
+      'Italy': '🇮🇹',
+      'Spain': '🇪🇸',
+      'Netherlands': '🇳🇱',
+      'Sweden': '🇸🇪',
+      'Norway': '🇳🇴',
+      'Singapore': '🇸🇬',
+      'Hong Kong': '🇭🇰',
+      'India': '🇮🇳',
+      'Brazil': '🇧🇷',
+      'Mexico': '🇲🇽',
+      'Russia': '🇷🇺',
+      'South Africa': '🇿🇦',
+      'Turkey': '🇹🇷'
     };
 
     const fmtEn = new Intl.DateTimeFormat('en-GB', {
