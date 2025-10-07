@@ -60,22 +60,22 @@ async function fetchTradingEconomics(fromMs, toMs) {
     const countriesFound = [...new Set(events.map(e => e.Country))];
     console.log('[API] Countries in response:', countriesFound.join(', '));
     
-    // FIX: Map actual field names from API response
+    // FIX: Accept ALL major countries (no filter at fetch stage)
     const normalized = events.map(e => ({
-      country: normalizeCountry(e.Country),
+      country: e.Country, // Keep original country name
       event: e.Event || 'Unknown Event',
       date: e.Date,
-      actual: e.Actual || null,           // FIXED: Capital A
+      actual: e.Actual || null,
       forecast: e.Forecast || e.TEForecast || null,
-      previous: e.Previous || null,       // FIXED: Capital P
-      impact: mapImportance(e.Importance),
-      rawCountry: e.Country // Keep for debugging
-    })).filter(e => e.country);
+      previous: e.Previous || null,
+      importance: e.Importance,
+      impact: mapImportance(e.Importance)
+    }));
     
-    console.log(`[API] After country filter: ${normalized.length} events from major countries`);
+    console.log(`[API] Normalized ${normalized.length} events (no country filter)`);
     if (normalized.length > 0) {
       console.log('[API] Sample events:', normalized.slice(0, 3).map(e => 
-        `${e.country}: ${e.event} @ ${e.date} [F:${e.forecast} P:${e.previous}]`
+        `${e.country}: ${e.event} @ ${e.date} [IMP:${e.importance} F:${e.forecast} P:${e.previous}]`
       ));
     }
     return normalized;
@@ -89,19 +89,6 @@ function mapImportance(importance) {
   if (importance === 3) return 'high';
   if (importance === 2) return 'medium';
   return 'low';
-}
-
-function normalizeCountry(name) {
-  // TOP 6 MAJOR ECONOMIES ONLY (by GDP)
-  const map = {
-    'United States': 'United States',
-    'China': 'China',
-    'Japan': 'Japan',
-    'Germany': 'Germany',
-    'United Kingdom': 'United Kingdom',
-    'Euro Area': 'Euro Area'
-  };
-  return map[name] || null;
 }
 
 async function fetchManual(fromMs, toMs) {
@@ -271,32 +258,45 @@ module.exports = async function handler(req, res) {
     console.log(`[EVENTS] Total unique: ${events_total}`);
 
     // ---- Filtering ----------------------------------------------------------
-    // Only allow top 6 major economies
-    const ALLOW_COUNTRIES = [
-      'United States',
-      'China', 
-      'Japan',
-      'Germany',
-      'United Kingdom',
-      'Euro Area'
+    // FIX: Filter by importance first, then by major countries
+    const MAJOR_COUNTRIES = [
+      'United States', 'United Kingdom', 'Euro Area', 'Germany', 'France', 
+      'Japan', 'China', 'Canada', 'Australia', 'Switzerland', 'India'
     ];
+    
     const MAJOR_KEYWORDS = ['CPI','NFP','FOMC','RATE','RATES','INTEREST','GDP','PMI','ECB','BOE','FED','NON-FARM','NONFARM','UNEMPLOYMENT','JOBLESS','RETAIL','SALES','INFLATION','PAYROLL','EMPLOYMENT'];
 
-    const filtered = all.filter(e => {
-      if (!ALLOW_COUNTRIES.includes(e.country)) return false;
-      if (mode === 'all') return true;
-      const txt = String(e.event || '').toUpperCase();
-      return MAJOR_KEYWORDS.some(k => txt.includes(k));
-    }).slice(0, limit);
+    // Step 1: Filter by importance = 3 (high impact only)
+    const highImpact = all.filter(e => e.importance === 3);
+    console.log(`[FILTER] High impact (importance=3): ${highImpact.length} events`);
+    
+    // Step 2: Filter by major countries
+    const majorCountries = highImpact.filter(e => 
+      MAJOR_COUNTRIES.some(c => e.country.includes(c) || c.includes(e.country))
+    );
+    console.log(`[FILTER] Major countries: ${majorCountries.length} events`);
+    
+    // Step 3: Apply keyword filter if mode=major
+    let filtered = majorCountries;
+    if (mode === 'major') {
+      filtered = majorCountries.filter(e => {
+        const txt = String(e.event || '').toUpperCase();
+        return MAJOR_KEYWORDS.some(k => txt.includes(k));
+      });
+      console.log(`[FILTER] After keyword filter: ${filtered.length} events`);
+    }
+    
+    // Step 4: Apply limit
+    filtered = filtered.slice(0, limit);
 
-    console.log(`[FILTER] After filters: ${filtered.length} events (mode: ${mode}, limit: ${limit})`);
+    console.log(`[FILTER] Final (after limit): ${filtered.length} events`);
     if (filtered.length > 0) {
       console.log('[FILTER] Sample:', filtered.slice(0, 3).map(e => 
         `${e.country}: ${e.event} @ ${new Date(e.ts).toISOString().slice(0,16)}`
       ));
     }
 
-    // ---- Cache for /api/econ/upcoming (FIX: Do this BEFORE response) -------
+    // ---- Cache for /api/econ/upcoming ---------------------------------------
     const cacheEnd = now + 7 * 24 * 60 * 60 * 1000; // 7 days
     let cacheEvents = [];
     
@@ -319,8 +319,11 @@ module.exports = async function handler(req, res) {
         cacheMap.set(key, { ...ev, ts: Date.parse(ev.date) });
       }
     }
+    
+    // Filter cache: high impact + major countries only
     const cacheFiltered = Array.from(cacheMap.values())
-      .filter(e => e.ts >= now && ALLOW_COUNTRIES.includes(e.country)) // FIX: Only future events
+      .filter(e => e.ts >= now && e.importance === 3) // High impact only
+      .filter(e => MAJOR_COUNTRIES.some(c => e.country.includes(c) || c.includes(e.country)))
       .sort((a, b) => a.ts - b.ts)
       .slice(0, 50);
 
@@ -336,7 +339,8 @@ module.exports = async function handler(req, res) {
           forecast: e.forecast,
           previous: e.previous,
           actual: e.actual,
-          impact: e.impact
+          impact: e.impact,
+          importance: e.importance
         }))
       }),
       { ex: 3600 } // Cache for 1 hour
@@ -360,7 +364,12 @@ module.exports = async function handler(req, res) {
       'United Kingdom': '🇬🇧',
       'Japan': '🇯🇵',
       'China': '🇨🇳',
-      'Germany': '🇩🇪'
+      'Germany': '🇩🇪',
+      'France': '🇫🇷',
+      'Canada': '🇨🇦',
+      'Australia': '🇦🇺',
+      'Switzerland': '🇨🇭',
+      'India': '🇮🇳'
     };
 
     const fmtEn = new Intl.DateTimeFormat('en-GB', {
