@@ -76,24 +76,34 @@ export default async function handler(req, res) {
       events = raw.map(normalizeTE);
     } else {
       source = 'manual';
-     // ---- MANUAL fallback (read events scheduled in KV within [now, endTs]) ----
+    // ---- MANUAL fallback (read events scheduled in KV within [now, endTs]) ----
 source = 'manual';
 
-// ⛔ old (remove): const manual = await kv.zrangebyscore('econ:manual', now, endTs);
-// ✅ correct:
-const manual = await kv.zrange('econ:manual', now, endTs, { byScore: true });
+let manual = [];
+try {
+  // SDK path (works on newer @vercel/kv)
+  manual = await kv.zrange('econ:manual', String(now), String(endTs), { byScore: true });
+} catch (_) {
+  // REST fallback (works on ALL versions)
+  const url = `${process.env.KV_REST_API_URL}/zrange/econ:manual/${now}/${endTs}?byScore=true`;
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}` }
+  });
+  manual = r.ok ? await r.json() : [];
+}
 
 events = manual
-  .map((m) => { try { return JSON.parse(m); } catch { return null; } })
+  .map(m => { try { return JSON.parse(m); } catch { return null; } })
   .filter(Boolean)
-  .map((e) => ({
+  .map(e => ({
     country: e.country,
-    event:   e.event,
-    date:    e.date,
+    event: e.event,
+    date: e.date,
     forecast: e.forecast ?? null,
     previous: e.previous ?? null,
-    importance: '3', // treat manual as high-impact
+    importance: '3',
   }));
+
 
 
     // Filter: importance, country, window
